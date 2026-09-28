@@ -43,7 +43,7 @@ static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
     return (tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK;
 }
 
-static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
+static inline unsigned int tb_jmp_cache_hash_func(vaddr pc, uint64_t cs_base)
 {
     vaddr tmp;
     tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
@@ -53,11 +53,23 @@ static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 
 #else
 
-/* In user-mode we can get better hashing because we do not have a TLB */
-static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
+/*
+ * In user-mode we can get better hashing because we do not have a TLB.
+ * cs_base is mixed in, so that the TBs of one pc with different cs_base
+ * (e.g. Arm PSTATE.BTYPE: a function entered by BL and by BLR, a switch
+ * case entered by BR and falling through) do not evict each other.
+ */
+static inline unsigned int tb_jmp_cache_hash_cs(uint64_t cs_base)
 {
-    return ((pc >> TB_JMP_CACHE_HASH_S1) ^ (pc >> TB_JMP_CACHE_HASH_S2) ^
-            (pc >> TB_JMP_CACHE_HASH_S3)) & (TB_JMP_CACHE_SIZE - 1);
+    return (uint32_t)((uint32_t)(cs_base ^ (cs_base >> 32))
+                      * TB_JMP_CACHE_HASH_CS_MUL) >> (32 - TB_JMP_CACHE_BITS);
+}
+
+static inline unsigned int tb_jmp_cache_hash_func(vaddr pc, uint64_t cs_base)
+{
+    return (((pc >> TB_JMP_CACHE_HASH_S1) ^ (pc >> TB_JMP_CACHE_HASH_S2) ^
+             (pc >> TB_JMP_CACHE_HASH_S3)) & (TB_JMP_CACHE_SIZE - 1))
+           ^ tb_jmp_cache_hash_cs(cs_base);
 }
 
 #endif /* CONFIG_SOFTMMU */

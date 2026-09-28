@@ -2682,13 +2682,30 @@ void tcg_gen_lookup_and_goto_ptr_cached_tb(TCGv_i64 pc, TCGv_i32 flags,
     tb = tcg_temp_ebb_new_ptr();
     p = tcg_temp_ebb_new_ptr();
 
-    /* entry = &jc->array[tb_jmp_cache_hash_func(pc)], user-mode version */
+    /* entry = &jc->array[tb_jmp_cache_hash_func(pc, cs_base)] (user mode) */
     tcg_gen_shri_i64(h, pc, TB_JMP_CACHE_HASH_S1);
     tcg_gen_shri_i64(t, pc, TB_JMP_CACHE_HASH_S2);
     tcg_gen_xor_i64(h, h, t);
     tcg_gen_shri_i64(t, pc, TB_JMP_CACHE_HASH_S3);
     tcg_gen_xor_i64(h, h, t);
     tcg_gen_andi_i64(h, h, TB_JMP_CACHE_SIZE - 1);
+    /* ^ tb_jmp_cache_hash_cs(cs_base) */
+    if (tcgv_i64_temp(cs_base)->kind == TEMP_CONST) {
+        uint64_t cs = tcgv_i64_temp(cs_base)->val;
+        uint32_t c = (uint32_t)((uint32_t)(cs ^ (cs >> 32))
+                                * TB_JMP_CACHE_HASH_CS_MUL)
+                     >> (32 - TB_JMP_CACHE_BITS);
+        if (c) {
+            tcg_gen_xori_i64(h, h, c);
+        }
+    } else {
+        tcg_gen_shri_i64(t, cs_base, 32);
+        tcg_gen_xor_i64(t, t, cs_base);
+        tcg_gen_ext32u_i64(t, t);
+        tcg_gen_muli_i64(t, t, TB_JMP_CACHE_HASH_CS_MUL);
+        tcg_gen_extract_i64(t, t, 32 - TB_JMP_CACHE_BITS, TB_JMP_CACHE_BITS);
+        tcg_gen_xor_i64(h, h, t);
+    }
     tcg_gen_shli_i64(h, h, 4);
     tcg_gen_trunc_i64_ptr(ent, h);
     tcg_gen_ld_ptr(jc, tcg_env, cpu_ofs + offsetof(CPUState, tb_jmp_cache));

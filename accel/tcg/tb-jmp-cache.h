@@ -24,6 +24,7 @@
 #define TB_JMP_CACHE_HASH_S1   1
 #define TB_JMP_CACHE_HASH_S2   2
 #define TB_JMP_CACHE_HASH_S3   (TB_JMP_CACHE_BITS + 2)
+#define TB_JMP_CACHE_HASH_CS_MUL 0x9e3779b1u
 
 /*
  * Invalidated in parallel; all accesses to 'tb' must be atomic.
