@@ -125,6 +125,16 @@ typedef struct DisasContext {
     const GPtrArray *decoders;
     /* a vector instruction (not vsetvl*) reads the vector TB flags */
     bool uses_vec_flags;
+    /*
+     * A vsetvli/vsetivli with a known vl went on with the TB: vill, sew,
+     * lmul, vta, vma, altfmt, vl_eq_vlmax and vstart_eq_zero are its
+     * state, no longer that of the TB flags, and vec_flags holds the
+     * vector TB flags of that state.
+     */
+    bool vtype_known;
+    uint32_t vec_flags;
+    /* vl, when known (-1 otherwise) */
+    int32_t vl_const;
     /* zicfilp extension. fcfi_enabled, lp expected or not */
     bool fcfi_enabled;
     bool fcfi_lp_expected;
@@ -331,21 +341,29 @@ static bool riscv_tb_generic(DisasContext *ctx)
  * Instructions inside a TB change none of the state in the TB flags,
  * except that vstart returns to zero, which can only leave VSTART_EQ_ZERO
  * and VL_EQ_VLMAX conservative (the next TB is then just less optimized),
- * and that Zicfilp sets ELP: not with it.  The next TB may be generic; if
- * this one is, its vector flags are unknown: only a generic TB matches.
+ * that Zicfilp sets ELP: not with it, and that a vsetvli with a known vl
+ * may set the vector state, which is then known (vtype_known).  The next
+ * TB may be generic; if this one is, its vector flags are unknown (unless
+ * vtype_known): only a generic TB matches.
  */
 static void lookup_and_goto_ptr_cached(DisasContext *ctx)
 {
 #ifdef CONFIG_USER_ONLY
     if (!ctx->fcfi_enabled && get_xl(ctx) == MXL_RV64) {
         uint32_t own = ctx->base.tb->flags;
-        uint32_t gen = (own & ~RISCV_TB_FLAGS_VEC_MASK)
-                       | RISCV_TB_FLAGS_VEC_GENERIC;
+        uint64_t cs_base = ctx->base.tb->cs_base;
+        uint32_t gen;
         TCGv_i64 pc = tcg_temp_new_i64();
-        TCGv_i64 cs = tcg_constant_i64(ctx->base.tb->cs_base);
+        TCGv_i64 cs;
 
+        if (ctx->vtype_known) {
+            own = (own & ~RISCV_TB_FLAGS_VEC_MASK) | ctx->vec_flags;
+            cs_base = FIELD_DP64(cs_base, EXT_TB_FLAGS, ALTFMT, ctx->altfmt);
+        }
+        gen = (own & ~RISCV_TB_FLAGS_VEC_MASK) | RISCV_TB_FLAGS_VEC_GENERIC;
+        cs = tcg_constant_i64(cs_base);
         tcg_gen_extu_tl_i64(pc, cpu_pc);
-        if (riscv_tb_generic(ctx)) {
+        if (riscv_tb_generic(ctx) && !ctx->vtype_known) {
             tcg_gen_lookup_and_goto_ptr_cached_tb(pc, tcg_constant_i32(gen),
                                                   cs);
         } else {
@@ -1370,9 +1388,10 @@ static void decode_opc(CPURISCVState *env, DisasContext *ctx)
         {
             uint32_t major = opcode & 0x7f, funct3 = extract32(opcode, 12, 3);
 
-            if ((major == 0x57 && funct3 != 7) ||
-                ((major == 0x07 || major == 0x27) &&
-                 (funct3 == 0 || funct3 >= 5))) {
+            if (!ctx->vtype_known &&
+                ((major == 0x57 && funct3 != 7) ||
+                 ((major == 0x07 || major == 0x27) &&
+                  (funct3 == 0 || funct3 >= 5)))) {
                 ctx->uses_vec_flags = true;
             }
         }
@@ -1436,6 +1455,9 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->fcfi_lp_expected = FIELD_EX32(tb_flags, TB_FLAGS, FCFI_LP_EXPECTED);
     ctx->fcfi_enabled = FIELD_EX32(tb_flags, TB_FLAGS, FCFI_ENABLED);
     ctx->uses_vec_flags = false;
+    ctx->vtype_known = false;
+    ctx->vl_const = ctx->vl_eq_vlmax && !ctx->vill
+                    ? vext_get_vlmax(cpu->cfg.vlenb, ctx->sew, ctx->lmul) : -1;
     ctx->zero = tcg_constant_tl(0);
     ctx->virt_inst_excp = false;
     ctx->decoders = cpu->decoders;
@@ -1521,6 +1543,10 @@ static void riscv_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
         g_assert_not_reached();
     }
     tcg_ctx->gen_tb_generic = riscv_tb_generic(ctx);
+    if (ctx->vtype_known) {
+        /* all the exits come after that vsetvli: see tb_flags_generic_mask */
+        tcg_ctx->gen_tb_jmp_any = 3;
+    }
 }
 
 static const TranslatorOps riscv_tr_ops = {

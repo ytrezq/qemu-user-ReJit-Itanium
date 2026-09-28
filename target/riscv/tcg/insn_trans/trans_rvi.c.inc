@@ -1007,6 +1007,59 @@ static bool do_csrr(DisasContext *ctx, int rd, int rc)
     TCGv dest = dest_gpr(ctx, rd);
     TCGv_i32 csr = tcg_constant_i32(rc);
 
+#ifdef CONFIG_USER_ONLY
+    /*
+     * Reads of the FP and vector CSRs have no side effects: no need to
+     * leave the TB (glibc's sin, cos... read frm at each call).  frm is in
+     * the TB flags, and so are FS and VS, which a user-mode CPU keeps on.
+     */
+    switch (rc) {
+    case CSR_FRM:
+        if (has_ext(ctx, RVF)) {
+            tcg_gen_movi_tl(dest, ctx->fpj_frm);
+            gen_set_gpr(ctx, rd, dest);
+            return true;
+        }
+        break;
+    case CSR_FFLAGS:
+    case CSR_FCSR:
+        if (has_ext(ctx, RVF)) {
+            decode_save_opc(ctx, 0);
+            gen_helper_csrr(dest, tcg_env, csr);
+            gen_set_gpr(ctx, rd, dest);
+            return true;
+        }
+        break;
+    case CSR_VL:
+        if (ctx->cfg_ptr->ext_zve32x) {
+            tcg_gen_extu_i32_tl(dest, cpu_vl);
+            gen_set_gpr(ctx, rd, dest);
+            return true;
+        }
+        break;
+    case CSR_VTYPE:
+        if (ctx->cfg_ptr->ext_zve32x && get_xl(ctx) == MXL_RV64) {
+            /* read_vtype(): vill in bit XLEN - 1 */
+            TCGv t = tcg_temp_new();
+
+            tcg_gen_ld_tl(dest, tcg_env, offsetof(CPURISCVState, vtype));
+            tcg_gen_ld8u_tl(t, tcg_env, offsetof(CPURISCVState, vill));
+            tcg_gen_shli_tl(t, t, TARGET_LONG_BITS - 1);
+            tcg_gen_or_tl(dest, dest, t);
+            gen_set_gpr(ctx, rd, dest);
+            return true;
+        }
+        break;
+    case CSR_VLENB:
+        if (ctx->cfg_ptr->ext_zve32x) {
+            tcg_gen_movi_tl(dest, ctx->cfg_ptr->vlenb);
+            gen_set_gpr(ctx, rd, dest);
+            return true;
+        }
+        break;
+    }
+#endif
+
     translator_io_start(&ctx->base);
     gen_helper_csrr(dest, tcg_env, csr);
     gen_set_gpr(ctx, rd, dest);

@@ -3641,7 +3641,7 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     int insn, sub;
     TCGArg a0, a1, a2, a3;
 
-    if (tcg_out_fpop_vec(s, opc, type, vece, args)) {
+    if (tcg_out_fpop_vec(s, opc, type, vece, args, const_args)) {
         return;
     }
 
@@ -3971,11 +3971,11 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fpcmpcc_vec:
         return C_O1_I2(r, x, x);
     case INDEX_op_ldm_vec:
-        return C_O1_I2(x, r, r);
+        return C_O1_I2(x, r, ri);
     case INDEX_op_ldmm_vec:
-        return C_O1_I3(x, 0, r, r);
+        return C_O1_I3(x, 0, r, ri);
     case INDEX_op_stm_vec:
-        return C_O0_I3(x, r, r);
+        return C_O0_I3(x, r, ri);
     case INDEX_op_st32_vec:
         return C_O0_I2(x, r);
     case INDEX_op_ld32_vec:

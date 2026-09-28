@@ -1411,6 +1411,28 @@ static void fpo_kmov_elems(TCGContext *s, TCGType type, unsigned vece,
     tcg_out_vex_modrm(s, opc, FPK1, 0, r);
 }
 
+/*
+ * Masked moves with a constant mask (@cmask): false if it selects all the
+ * elements of @type, for a plain vmovdqu, which (unlike the masked moves)
+ * stores can forward from and loads can forward to; else k1 = @val.
+ */
+static bool fpo_kmov_const(TCGContext *s, TCGType type, unsigned vece,
+                           uint64_t val)
+{
+    int n = (8 << (type - TCG_TYPE_V64)) >> vece;
+
+    if (n == 64 ? val == UINT64_MAX : (val & MAKE_64BIT_MASK(0, n))
+                                       == MAKE_64BIT_MASK(0, n)) {
+        return false;
+    }
+    /* kmovq k1, [rip + pool] */
+    tcg_out_vex_opc(s, 0x90 | P_EXT | P_VEXW, FPK1, 0, 0, 0);
+    tcg_out8(s, (FPK1 << 3) | 5);
+    tcg_out32(s, 0);
+    new_pool_label(s, val, R_386_PC32, s->code_ptr - 4, -4);
+    return true;
+}
+
 /* vmovdqu8/16/32/64 load or store for the vector length of @type */
 static int fpo_movdqu(TCGType type, unsigned vece, bool store)
 {
@@ -1487,7 +1509,8 @@ static void tcg_out_fpop_i64(TCGContext *s, TCGOpcode opc, unsigned vece,
 
 /* Dispatch from tcg_out_vec_op(); returns false if @opc is not ours. */
 static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
-                             unsigned vece, const TCGArg *args)
+                             unsigned vece, const TCGArg *args,
+                             const int *const_args)
 {
     switch (opc) {
     case INDEX_op_fpop1_vec:
@@ -1520,16 +1543,27 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
         tcg_out_fpop_i64(s, opc, vece, args);
         return true;
     case INDEX_op_ldm_vec:
-        /* vmovdqu<e> d{k1}{z}, [ptr]: masked-off elements do not fault */
-        fpo_kmov_elems(s, type, vece, args[2]);
-        fpo_rm_base(s, fpo_movdqu(type, vece, false), FPX(args[0]), args[1],
-                    FPK1, true);
-        return true;
     case INDEX_op_ldmm_vec:
-        /* vmovdqu<e> d{k1}, [ptr] with d == old: merging */
-        fpo_kmov_elems(s, type, vece, args[3]);
-        fpo_rm_base(s, fpo_movdqu(type, vece, false), FPX(args[0]), args[2],
-                    FPK1, false);
+        {
+            /* vmovdqu<e> d{k1}{z}, [ptr]: masked-off elements do not fault */
+            bool merge = opc == INDEX_op_ldmm_vec;
+            int m = merge ? 3 : 2;
+
+            if (const_args[m]) {
+                if (!fpo_kmov_const(s, type, vece, args[m])) {
+                    tcg_out_vex_modrm_offset(s, OPC_MOVDQU_VxWx
+                                             | (type == TCG_TYPE_V256
+                                                ? P_VEXL : 0),
+                                             args[0], 0, args[m - 1], 0);
+                    return true;
+                }
+            } else {
+                fpo_kmov_elems(s, type, vece, args[m]);
+            }
+            /* with d == old for ldmm_vec: merging */
+            fpo_rm_base(s, fpo_movdqu(type, vece, false), FPX(args[0]),
+                        args[m - 1], FPK1, !merge);
+        }
         return true;
     case INDEX_op_crypto_vec:
         tcg_out_crypto(s, FPX(args[0]), FPX(args[1]), FPX(args[2]),
@@ -1546,7 +1580,17 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
                                  args[2]);
         return true;
     case INDEX_op_stm_vec:
-        fpo_kmov_elems(s, type, vece, args[2]);
+        if (const_args[2]) {
+            if (!fpo_kmov_const(s, type, vece, args[2])) {
+                tcg_out_vex_modrm_offset(s, OPC_MOVDQU_WxVx
+                                         | (type == TCG_TYPE_V256
+                                            ? P_VEXL : 0),
+                                         args[0], 0, args[1], 0);
+                return true;
+            }
+        } else {
+            fpo_kmov_elems(s, type, vece, args[2]);
+        }
         fpo_rm_base(s, fpo_movdqu(type, vece, true), FPX(args[0]), args[1],
                     FPK1, false);
         return true;

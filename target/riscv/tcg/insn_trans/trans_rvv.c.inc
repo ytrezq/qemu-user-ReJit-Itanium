@@ -203,6 +203,41 @@ static bool require_noover(const int8_t dst, const int8_t dst_lmul,
  * @avl: the AVL, or NULL for rs1 = x0 (VLMAX if rd != x0, else vl).
  * Returns false if not applicable, for the general path.
  */
+/*
+ * After vsetvli/vsetivli with a vtype valid for the CPU and a known vl:
+ * the rest of the TB goes on with that vector state (vtype_known).
+ */
+static void vsetvl_known(DisasContext *s, target_ulong vtype, uint32_t vl,
+                         uint32_t vlmax)
+{
+    uint32_t vlmul = FIELD_EX64(vtype, VTYPE, VLMUL);
+    uint32_t vsew = FIELD_EX64(vtype, VTYPE, VSEW);
+    bool vta = FIELD_EX64(vtype, VTYPE, VTA);
+    bool vma = FIELD_EX64(vtype, VTYPE, VMA);
+    /* as riscv_get_tb_cpu_state() computes them */
+    bool eq = vl == vlmax && (vlmax << vsew) >= 8;
+    uint32_t f = 0;
+
+    s->vtype_known = true;
+    s->vill = false;
+    s->sew = vsew;
+    s->lmul = sextract32(vlmul, 0, 3);
+    s->vta = vta && s->cfg_ptr->rvv_ta_all_1s;
+    s->vma = vma && s->cfg_ptr->rvv_ma_all_1s;
+    s->altfmt = FIELD_EX64(vtype, VTYPE, ALTFMT);
+    s->vstart_eq_zero = true;
+    s->vl_eq_vlmax = eq;
+    s->vl_const = vl;
+
+    f = FIELD_DP32(f, TB_FLAGS, SEW, vsew);
+    f = FIELD_DP32(f, TB_FLAGS, LMUL, vlmul);
+    f = FIELD_DP32(f, TB_FLAGS, VL_EQ_VLMAX, eq);
+    f = FIELD_DP32(f, TB_FLAGS, VTA, vta);
+    f = FIELD_DP32(f, TB_FLAGS, VMA, vma);
+    f = FIELD_DP32(f, TB_FLAGS, VSTART_EQ_ZERO, 1);
+    s->vec_flags = f;
+}
+
 static bool do_vsetvl_imm(DisasContext *s, int rd, int rs1, TCGv avl,
                           target_ulong vtype)
 {
@@ -213,7 +248,7 @@ static bool do_vsetvl_imm(DisasContext *s, int rd, int rs1, TCGv avl,
     bool altfmt = FIELD_EX64(vtype, VTYPE, ALTFMT);
     int rsv = cfg->ext_zvfbfa ? R_VTYPE_RESERVED_SHIFT : R_VTYPE_ALTFMT_SHIFT;
     uint32_t vlmax, maxsz;
-    bool vl_const = false;
+    int64_t vl_const = -1;
     TCGv_i32 vl;
     TCGv dst;
 
@@ -237,16 +272,16 @@ static bool do_vsetvl_imm(DisasContext *s, int rd, int rs1, TCGv avl,
     maxsz = vlmax << vsew;
     vl = tcg_temp_new_i32();
     if (avl == NULL && rd != 0) {
-        tcg_gen_movi_i32(vl, vlmax);
-        vl_const = true;
+        vl_const = vlmax;
+        tcg_gen_movi_i32(vl, vl_const);
     } else if (avl == NULL) {
         /* vl = min(vl, VLMAX) */
         tcg_gen_umin_i32(vl, cpu_vl, tcg_constant_i32(vlmax));
     } else if (tcgv_tl_temp(avl)->kind == TEMP_CONST) {
         target_ulong a = tcgv_tl_temp(avl)->val;
 
-        tcg_gen_movi_i32(vl, MIN(a, vlmax));
-        vl_const = true;
+        vl_const = MIN(a, vlmax);
+        tcg_gen_movi_i32(vl, vl_const);
     } else {
         TCGv t = tcg_temp_new();
 
@@ -265,9 +300,15 @@ static bool do_vsetvl_imm(DisasContext *s, int rd, int rs1, TCGv avl,
     gen_set_gpr(s, rd, dst);
     finalize_rvv_inst(s);
 
+    if (vl_const >= 0) {
+        /* the vector state is known from here on: go on with the TB */
+        vsetvl_known(s, vtype, vl_const, vlmax);
+        return true;
+    }
+
     /* both exits set the vector state: see tb_flags_generic_mask */
     tcg_ctx->gen_tb_jmp_any = 3;
-    if (vl_const || maxsz < 8) {
+    if (maxsz < 8) {
         gen_goto_tb(s, 0, s->cur_insn_len);
     } else {
         TCGLabel *eq = gen_new_label();
@@ -848,12 +889,78 @@ static bool ldst_us_trans(uint32_t vd, uint32_t rs1, uint32_t data,
 
 #ifdef CONFIG_USER_ONLY
 /*
+ * The first @bytes bytes of a register (vreg offset @ofs) from or to
+ * rs1 + @gofs, as plain loads and stores of 8, 4, 2 and 1 bytes: stores
+ * can forward to the loads that follow, unlike masked ones (vle8.v and
+ * vse8.v with a small vl are GCC's memcpy of structures).  The pieces
+ * never split an element, @bytes being a multiple of its size.
+ */
+static void ldst_us_prefix(DisasContext *s, int rs1, uint32_t gofs,
+                           uint32_t ofs, uint32_t bytes, bool is_store)
+{
+    TCGv addr = get_address(s, rs1, gofs);
+    TCGv_ptr host = tcg_temp_new_ptr();
+    TCGv_i64 t = tcg_temp_new_i64();
+    uint32_t o = 0;
+
+    tcg_gen_addi_tl(addr, addr, guest_base);
+    tcg_gen_trunc_i64_ptr(host, addr);
+    while (o < bytes) {
+        uint32_t p = bytes - o >= 8 ? 8 : bytes - o >= 4 ? 4
+                   : bytes - o >= 2 ? 2 : 1;
+
+        if (is_store) {
+            switch (p) {
+            case 8:
+                tcg_gen_ld_i64(t, tcg_env, ofs + o);
+                tcg_gen_st_i64(t, host, o);
+                break;
+            case 4:
+                tcg_gen_ld32u_i64(t, tcg_env, ofs + o);
+                tcg_gen_st32_i64(t, host, o);
+                break;
+            case 2:
+                tcg_gen_ld16u_i64(t, tcg_env, ofs + o);
+                tcg_gen_st16_i64(t, host, o);
+                break;
+            default:
+                tcg_gen_ld8u_i64(t, tcg_env, ofs + o);
+                tcg_gen_st8_i64(t, host, o);
+                break;
+            }
+        } else {
+            switch (p) {
+            case 8:
+                tcg_gen_ld_i64(t, host, o);
+                tcg_gen_st_i64(t, tcg_env, ofs + o);
+                break;
+            case 4:
+                tcg_gen_ld32u_i64(t, host, o);
+                tcg_gen_st32_i64(t, tcg_env, ofs + o);
+                break;
+            case 2:
+                tcg_gen_ld16u_i64(t, host, o);
+                tcg_gen_st16_i64(t, tcg_env, ofs + o);
+                break;
+            default:
+                tcg_gen_ld8u_i64(t, host, o);
+                tcg_gen_st8_i64(t, tcg_env, ofs + o);
+                break;
+            }
+        }
+        o += p;
+    }
+}
+
+/*
  * vle<eew>.v and vse<eew>.v without segments and from vstart 0, as one
  * masked host access per register of the group (vmovdqu<eew> with an
  * AVX-512 opmask): the elements past vl, or whose v0 bit is clear, are
  * neither accessed (so they cannot fault) nor changed, which is what tail
- * and mask undisturbed ask.  A fault leaves vstart at 0, the registers of
- * the group before the faulting one possibly written.
+ * and mask undisturbed ask.  With vl known and no v0 mask, plain accesses
+ * instead.  A fault leaves vstart at 0, the registers of the group before
+ * the faulting one (or the pieces before, see ldst_us_prefix) possibly
+ * written.
  */
 static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
                            bool is_store)
@@ -879,17 +986,39 @@ static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
     mark_vs_dirty(s);
 
     for (r = 0; r < nregs; r++) {
-        TCGv addr = get_address(s, a->rs1, r * vlenb);
-        TCGv_ptr host = tcg_temp_new_ptr();
-        TCGv_vec v = tcg_temp_new_vec(type);
         uint32_t ofs = vreg_ofs(s, a->rd + r);
-        TCGv_i64 mask = NULL;
+        TCGv_i64 mask = NULL;               /* NULL: all the elements */
+        TCGv_ptr host;
+        TCGv_vec v;
+        TCGv addr;
 
+        /* the elements r * n to r * n + n - 1 of the group */
+        if (s->vl_const >= 0) {
+            uint32_t vlc = s->vl_const;
+            uint32_t cnt = MIN((r + 1) * n, vlc) - MIN(r * n, vlc);
+
+            if (cnt == 0) {
+                continue;
+            }
+            if (cnt < n) {
+                if (a->vm) {
+                    ldst_us_prefix(s, a->rs1, r * vlenb, ofs, cnt << eew,
+                                   is_store);
+                    continue;
+                }
+                mask = tcg_constant_i64(MAKE_64BIT_MASK(0, cnt));
+            }
+        }
+
+        addr = get_address(s, a->rs1, r * vlenb);
+        host = tcg_temp_new_ptr();
+        v = tcg_temp_new_vec(type);
         tcg_gen_addi_tl(addr, addr, guest_base);
         tcg_gen_trunc_i64_ptr(host, addr);
 
-        /* the elements r * n to r * n + n - 1 of the group */
-        if (!s->vl_eq_vlmax) {
+        if (s->vl_const >= 0) {
+            /* done above */
+        } else if (!s->vl_eq_vlmax) {
             TCGv_i32 hi = tcg_temp_new_i32();
             TCGv_i32 cnt = hi;
 
@@ -905,8 +1034,6 @@ static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
             tcg_gen_extu_i32_i64(mask, cnt);
             tcg_gen_shl_i64(mask, tcg_constant_i64(1), mask);
             tcg_gen_subi_i64(mask, mask, 1);
-        } else if (vlmax < n) {
-            mask = tcg_constant_i64(MAKE_64BIT_MASK(0, vlmax));
         }
         if (!a->vm) {
             uint32_t bit = r * n;
@@ -922,8 +1049,9 @@ static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
         }
 
         /*
-         * Masked moves even for a whole register: they do not require
-         * the alignment that ld_vec and st_vec may assume.
+         * Masked moves even for a whole register, with a constant mask (a
+         * plain vmovdqu): they do not require the alignment that ld_vec
+         * and st_vec may assume.
          */
         if (is_store) {
             tcg_gen_ld_vec(v, tcg_env, ofs);
