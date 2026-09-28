@@ -12,8 +12,13 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
-#define TB_JMP_CACHE_BITS 12
+#define TB_JMP_CACHE_BITS 14
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
+/*
+ * User mode: low pc bits that do not help the hash (instructions are at
+ * least 4-byte aligned on many targets).
+ */
+#define TB_JMP_CACHE_PC_SHIFT 2
 
 /*
  * Invalidated in parallel; all accesses to 'tb' must be atomic.

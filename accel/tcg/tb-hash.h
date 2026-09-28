@@ -56,7 +56,9 @@ static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 /* In user-mode we can get better hashing because we do not have a TLB */
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
-    return (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1);
+    return ((pc >> TB_JMP_CACHE_PC_SHIFT) ^
+            (pc >> (TB_JMP_CACHE_BITS + TB_JMP_CACHE_PC_SHIFT)))
+           & (TB_JMP_CACHE_SIZE - 1);
 }
 
 #endif /* CONFIG_SOFTMMU */

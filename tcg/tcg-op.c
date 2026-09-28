@@ -2681,9 +2681,10 @@ void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs)
     tb = tcg_temp_ebb_new_ptr();
     p = tcg_temp_ebb_new_ptr();
 
-    /* entry = &jc->array[(pc ^ (pc >> BITS)) & (SIZE - 1)] */
-    tcg_gen_shri_i64(h, pc, TB_JMP_CACHE_BITS);
-    tcg_gen_xor_i64(h, h, pc);
+    /* entry = &jc->array[tb_jmp_cache_hash_func(pc)], user-mode version */
+    tcg_gen_shri_i64(h, pc, TB_JMP_CACHE_BITS + TB_JMP_CACHE_PC_SHIFT);
+    tcg_gen_shri_i64(t, pc, TB_JMP_CACHE_PC_SHIFT);
+    tcg_gen_xor_i64(h, h, t);
     tcg_gen_andi_i64(h, h, TB_JMP_CACHE_SIZE - 1);
     tcg_gen_shli_i64(h, h, 4);
     tcg_gen_trunc_i64_ptr(ent, h);
