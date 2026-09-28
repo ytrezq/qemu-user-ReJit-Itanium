@@ -1948,7 +1948,19 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         *h = x86_guest_base;
     }
     h->base = addr;
-    h->aa = atom_and_align_for_opc(s, opc, MO_ATOM_WITHIN16, s_bits == MO_128);
+    /*
+     * A load or store of up to 8 bytes is done by x86 as one access within
+     * a cache line, which is atomic, or as two accesses split at a cache
+     * line boundary, which no naturally aligned sub-object straddles:
+     * MO_ATOM_SUBALIGN holds whatever the address (e.g. Arm LDRD/STRD and
+     * VLDR/VSTR of a double at a 4-aligned address, which otherwise took
+     * the slow path).
+     */
+    h->aa = atom_and_align_for_opc(s, opc,
+                                   (opc & MO_ATOM_MASK) == MO_ATOM_SUBALIGN
+                                   && s_bits <= MO_64
+                                   ? MO_ATOM_SUBALIGN : MO_ATOM_WITHIN16,
+                                   s_bits == MO_128);
     a_mask = (1 << h->aa.align) - 1;
 
     if (tcg_use_softmmu) {

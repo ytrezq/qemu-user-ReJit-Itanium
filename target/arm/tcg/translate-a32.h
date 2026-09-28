@@ -163,8 +163,19 @@ DO_GEN_ST(32, MO_UL)
 #define IS_USER(s) (s->user)
 #endif
 
-/* Set NZCV flags from the high 4 bits of var.  */
-#define gen_set_nzcv(var) gen_set_cpsr(var, CPSR_NZCV)
+/*
+ * Set NZCV flags from the high 4 bits of var, like cpsr_write() does,
+ * without the helper call and its hflags rebuild (NZCV is not in hflags):
+ * VMRS APSR_nzcv, FPSCR follows every VFP compare.
+ */
+static inline void gen_set_nzcv(TCGv_i32 var)
+{
+    tcg_gen_mov_i32(cpu_NF, var);
+    tcg_gen_not_i32(cpu_ZF, var);
+    tcg_gen_andi_i32(cpu_ZF, cpu_ZF, CPSR_Z);
+    tcg_gen_extract_i32(cpu_CF, var, 29, 1);
+    tcg_gen_shli_i32(cpu_VF, var, 3);
+}
 
 /* Swap low and high halfwords.  */
 static inline void gen_swap_half(TCGv_i32 dest, TCGv_i32 var)

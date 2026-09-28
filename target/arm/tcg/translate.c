@@ -4622,19 +4622,136 @@ static bool trans_##NAME(DisasContext *s, arg_rrr *a)   \
     return op_par_addsub_ge(s, a, helper);              \
 }
 
-DO_PAR_ADDSUB_GE(SADD16, gen_helper_sadd16)
+/*
+ * The byte and halfword forms in TCG ops rather than helpers: glibc's
+ * Arm string functions (strlen, strchr, strcmp...) are built on UADD8 and
+ * SEL.  Lanes are computed SWAR-style in a 32-bit register: the low bits
+ * of each lane first (no carry can leave the lane), then the top bit.
+ * GE stays 4 bits in env->GE, one per byte (two per halfword), see
+ * cpsr_read().
+ */
+
+/* env->GE = the bits 7, 15, 23 and 31 of @m, as GE[0..3] */
+static void gen_store_ge_bytes(TCGv_i32 m)
+{
+    TCGv_i32 t = tcg_temp_new_i32();
+
+    tcg_gen_shri_i32(t, m, 7);
+    tcg_gen_andi_i32(t, t, 0x01010101);
+    /* gather bits 0, 8, 16, 24 into bits 21..24, without carries */
+    tcg_gen_muli_i32(t, t, 0x00204081);
+    tcg_gen_extract_i32(t, t, 21, 4);
+    tcg_gen_st_i32(t, tcg_env, offsetof(CPUARMState, GE));
+}
+
+/* env->GE = bit 15 of @m twice, then bit 31 twice */
+static void gen_store_ge_halves(TCGv_i32 m)
+{
+    TCGv_i32 t = tcg_temp_new_i32();
+
+    tcg_gen_andi_i32(t, m, 0x80008000);
+    tcg_gen_shri_i32(m, t, 8);
+    tcg_gen_or_i32(m, m, t);
+    gen_store_ge_bytes(m);
+}
+
+/*
+ * d = a + b or a - b in lanes whose top bits are @top, and the GE mask of
+ * each lane in bit top: carry out (unsigned add), no borrow (unsigned
+ * sub), or a signed result >= 0.
+ */
+static void gen_par_addsub_lanes(TCGv_i32 d, TCGv_i32 ge, TCGv_i32 a,
+                                 TCGv_i32 b, uint32_t top, bool sub,
+                                 bool sgn)
+{
+    TCGv_i32 lo = tcg_temp_new_i32();
+    TCGv_i32 t = tcg_temp_new_i32();
+    TCGv_i32 x = tcg_temp_new_i32();
+
+    if (!sub) {
+        /* lo = the sums of the low bits, carrying into the top bits */
+        tcg_gen_andi_i32(lo, a, ~top);
+        tcg_gen_andi_i32(t, b, ~top);
+        tcg_gen_add_i32(lo, lo, t);
+        tcg_gen_xor_i32(x, a, b);
+        if (sgn) {
+            /* >= 0: both positive, or signs differ and a carry came in */
+            tcg_gen_nor_i32(ge, a, b);
+        } else {
+            /* carry out: majority of a, b and the carry in */
+            tcg_gen_and_i32(ge, a, b);
+        }
+        tcg_gen_and_i32(t, x, lo);
+        tcg_gen_or_i32(ge, ge, t);
+        tcg_gen_andi_i32(x, x, top);
+        tcg_gen_xor_i32(d, lo, x);
+    } else {
+        /* lo = (low bits of a) + 2^top - (low bits of b): no borrow out */
+        tcg_gen_ori_i32(lo, a, top);
+        tcg_gen_andi_i32(t, b, ~top);
+        tcg_gen_sub_i32(lo, lo, t);
+        /* x = the top bits equal; lo's top bit: no borrow from below */
+        tcg_gen_eqv_i32(x, a, b);
+        if (sgn) {
+            /* a >= b signed: a positive and b negative, or equal signs */
+            tcg_gen_andc_i32(ge, b, a);
+            tcg_gen_and_i32(t, x, lo);
+            tcg_gen_or_i32(ge, ge, t);
+        } else {
+            /* a >= b unsigned: a set and b clear, or equal and no borrow */
+            tcg_gen_andc_i32(ge, a, b);
+            tcg_gen_and_i32(t, x, lo);
+            tcg_gen_or_i32(ge, ge, t);
+        }
+        tcg_gen_andi_i32(x, x, top);
+        tcg_gen_xor_i32(d, lo, x);
+    }
+}
+
+static bool op_par_addsub_ge_inline(DisasContext *s, arg_rrr *a,
+                                    bool bytes, bool sub, bool sgn)
+{
+    TCGv_i32 t0, t1, ge;
+
+    if (s->thumb
+        ? !arm_dc_feature(s, ARM_FEATURE_THUMB_DSP)
+        : !ENABLE_ARCH_6) {
+        return false;
+    }
+
+    t0 = load_reg(s, a->rn);
+    t1 = load_reg(s, a->rm);
+    ge = tcg_temp_new_i32();
+    gen_par_addsub_lanes(t0, ge, t0, t1, bytes ? 0x80808080 : 0x80008000,
+                         sub, sgn);
+    if (bytes) {
+        gen_store_ge_bytes(ge);
+    } else {
+        gen_store_ge_halves(ge);
+    }
+    store_reg(s, a->rd, t0);
+    return true;
+}
+
+#define DO_PAR_ADDSUB_GE_INLINE(NAME, BYTES, SUB, SGN) \
+static bool trans_##NAME(DisasContext *s, arg_rrr *a)             \
+{                                                                 \
+    return op_par_addsub_ge_inline(s, a, BYTES, SUB, SGN);        \
+}
+
+DO_PAR_ADDSUB_GE_INLINE(SADD16, false, false, true)
 DO_PAR_ADDSUB_GE(SASX, gen_helper_saddsubx)
 DO_PAR_ADDSUB_GE(SSAX, gen_helper_ssubaddx)
-DO_PAR_ADDSUB_GE(SSUB16, gen_helper_ssub16)
-DO_PAR_ADDSUB_GE(SADD8, gen_helper_sadd8)
-DO_PAR_ADDSUB_GE(SSUB8, gen_helper_ssub8)
+DO_PAR_ADDSUB_GE_INLINE(SSUB16, false, true, true)
+DO_PAR_ADDSUB_GE_INLINE(SADD8, true, false, true)
+DO_PAR_ADDSUB_GE_INLINE(SSUB8, true, true, true)
 
-DO_PAR_ADDSUB_GE(UADD16, gen_helper_uadd16)
+DO_PAR_ADDSUB_GE_INLINE(UADD16, false, false, false)
 DO_PAR_ADDSUB_GE(UASX, gen_helper_uaddsubx)
 DO_PAR_ADDSUB_GE(USAX, gen_helper_usubaddx)
-DO_PAR_ADDSUB_GE(USUB16, gen_helper_usub16)
-DO_PAR_ADDSUB_GE(UADD8, gen_helper_uadd8)
-DO_PAR_ADDSUB_GE(USUB8, gen_helper_usub8)
+DO_PAR_ADDSUB_GE_INLINE(USUB16, false, true, false)
+DO_PAR_ADDSUB_GE_INLINE(UADD8, true, false, false)
+DO_PAR_ADDSUB_GE_INLINE(USUB8, true, true, false)
 
 DO_PAR_ADDSUB(QADD16, gen_helper_qadd16)
 DO_PAR_ADDSUB(QASX, gen_helper_qaddsubx)
@@ -4825,7 +4942,16 @@ static bool trans_SEL(DisasContext *s, arg_rrr *a)
     t2 = load_reg(s, a->rm);
     t3 = tcg_temp_new_i32();
     tcg_gen_ld_i32(t3, tcg_env, offsetof(CPUARMState, GE));
-    gen_helper_sel_flags(t1, t3, t1, t2);
+    /*
+     * byte mask from GE[3:0]: spread bit n to bit 8n without carries,
+     * then 0x01 -> 0xff; rd = GE ? rn : rm, bytewise
+     */
+    tcg_gen_muli_i32(t3, t3, 0x00204081);
+    tcg_gen_andi_i32(t3, t3, 0x01010101);
+    tcg_gen_muli_i32(t3, t3, 0xff);
+    tcg_gen_xor_i32(t1, t1, t2);
+    tcg_gen_and_i32(t1, t1, t3);
+    tcg_gen_xor_i32(t1, t1, t2);
     store_reg(s, a->rd, t1);
     return true;
 }
