@@ -105,6 +105,10 @@
 #define FPO_FLT_MIN     0x00800000u
 #define FPO_FLT_MIN_D   0x3810000000000000ull   /* FLT_MIN as a double */
 
+#define FPO_MOVDQU8_LD  (0x6f | P_EXT | P_SIMDF2)
+#define FPO_MOVDQU8_ST  (0x7f | P_EXT | P_SIMDF2)
+#define FPO_KMOVW_KR    (0x92 | P_EXT)
+
 /* Opmask instructions, VEX-encoded */
 #define FPO_KANDB       (0x41 | P_EXT | P_DATA16 | P_VEXL)
 #define FPO_KANDNB      (0x42 | P_EXT | P_DATA16 | P_VEXL)
@@ -192,6 +196,25 @@ static void fpo_rrr_er(TCGContext *s, int opc, int r, int v, int rm, int rc)
 {
     fpo_evex_opc_ll(s, opc, r, v, rm, true, 0, false, true, rc);
     tcg_out8(s, 0xc0 | ((r & 7) << 3) | (rm & 7));
+}
+
+/* op r{aaa}{z}, [base]: vector register and memory at a GPR */
+static void fpo_rm_base(TCGContext *s, int opc, int r, TCGReg base, int aaa,
+                        bool z)
+{
+    int b = base & 7;
+
+    /* the base register extension is EVEX.B, set from rm like a register */
+    fpo_evex_opc(s, opc, r, 0, base & 8, true, aaa, z, false);
+    if (b == 4) {                   /* rsp, r12: SIB */
+        tcg_out8(s, ((r & 7) << 3) | 4);
+        tcg_out8(s, 0x24);
+    } else if (b == 5) {            /* rbp, r13: [base + 0] */
+        tcg_out8(s, 0x40 | ((r & 7) << 3) | 5);
+        tcg_out8(s, 0);
+    } else {
+        tcg_out8(s, ((r & 7) << 3) | b);
+    }
 }
 
 /* op r, v, [rip + constant] without broadcast (scalar memory operand) */
@@ -891,6 +914,15 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
     case INDEX_op_fpcmpcc_vec:
         tcg_out_fpcmpcc(s, vece, args[0], FPX(args[1]), FPX(args[2]),
                         args[3]);
+        return true;
+    case INDEX_op_ldm_vec:
+        /* vmovdqu8 d{k1}{z}, [ptr]: masked-off bytes do not fault */
+        tcg_out_vex_modrm(s, FPO_KMOVW_KR, FPK1, 0, args[2]);
+        fpo_rm_base(s, FPO_MOVDQU8_LD, FPX(args[0]), args[1], FPK1, true);
+        return true;
+    case INDEX_op_stm_vec:
+        tcg_out_vex_modrm(s, FPO_KMOVW_KR, FPK1, 0, args[2]);
+        fpo_rm_base(s, FPO_MOVDQU8_ST, FPX(args[0]), args[1], FPK1, false);
         return true;
     case INDEX_op_perm2b_vec:
         /* d = idx, then d = (a:b)[d] */

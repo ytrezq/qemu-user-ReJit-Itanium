@@ -309,8 +309,69 @@ static bool trans_LXVB16X(DisasContext *ctx, arg_LXVB16X *a)
 }
 
 #if defined(TARGET_PPC64)
+#ifdef CONFIG_USER_ONLY
+/*
+ * lxvl, lxvll, stxvl, stxvll as one masked host access to the first
+ * min(RB[0:7], 16) bytes at EA.  Memory byte k is host byte k of the
+ * register for lxvl/stxvl in little-endian mode (VsrB(15 - k)); otherwise
+ * (VsrB(k)) the register bytes are reversed.
+ */
+static bool gen_ld_st_vl_inline(DisasContext *ctx, arg_X *a, bool store,
+                                bool lj)
+{
+    static const uint8_t rev_idx[16] QEMU_ALIGNED(16) = {
+        15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+    };
+    bool rev = !ctx->le_mode || lj;
+    TCGv_i64 nb, mask;
+    TCGv_ptr host;
+    TCGv ea;
+    TCGv_vec v, idx = NULL;
+
+    if (NARROW_MODE(ctx) || !tcg_can_emit_ldstm(TCG_TYPE_V128) ||
+        (rev && !tcg_can_emit_perm2b(TCG_TYPE_V128))) {
+        return false;
+    }
+    gen_set_access_type(ctx, ACCESS_INT);
+    ea = do_ea_calc_ra(ctx, a->ra);
+
+    /* mask = (1 << min(RB >> 56, 16)) - 1 */
+    nb = tcg_temp_new_i64();
+    mask = tcg_temp_new_i64();
+    tcg_gen_shri_i64(nb, cpu_gpr[a->rb], 56);
+    tcg_gen_umin_i64(nb, nb, tcg_constant_i64(16));
+    tcg_gen_shl_i64(mask, tcg_constant_i64(1), nb);
+    tcg_gen_subi_i64(mask, mask, 1);
+
+    host = tcg_temp_new_ptr();
+    tcg_gen_addi_i64(nb, ea, guest_base);
+    tcg_gen_trunc_i64_ptr(host, nb);
+
+    v = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (rev) {
+        idx = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_ld_vec(idx, tcg_constant_ptr(rev_idx), 0);
+    }
+    if (store) {
+        tcg_gen_ld_vec(v, tcg_env, vsr_full_offset(a->rt));
+        if (rev) {
+            tcg_gen_perm2b_vec(v, v, v, idx);
+        }
+        tcg_gen_stm_vec(v, host, mask);
+    } else {
+        tcg_gen_ldm_vec(v, host, mask);
+        if (rev) {
+            tcg_gen_perm2b_vec(v, v, v, idx);
+        }
+        tcg_gen_st_vec(v, tcg_env, vsr_full_offset(a->rt));
+    }
+    return true;
+}
+#endif
+
 static bool do_ld_st_vl(DisasContext *ctx, arg_X *a,
-                        void (*helper)(TCGv_ptr, TCGv, TCGv_ptr, TCGv))
+                        void (*helper)(TCGv_ptr, TCGv, TCGv_ptr, TCGv),
+                        bool store, bool lj)
 {
     TCGv EA;
     TCGv_ptr xt;
@@ -319,6 +380,11 @@ static bool do_ld_st_vl(DisasContext *ctx, arg_X *a,
     } else {
         REQUIRE_VECTOR(ctx);
     }
+#ifdef CONFIG_USER_ONLY
+    if (gen_ld_st_vl_inline(ctx, a, store, lj)) {
+        return true;
+    }
+#endif
     xt = gen_vsr_ptr(a->rt);
     gen_set_access_type(ctx, ACCESS_INT);
     EA = do_ea_calc_ra(ctx, a->ra);
@@ -332,7 +398,7 @@ static bool trans_LXVL(DisasContext *ctx, arg_LXVL *a)
     REQUIRE_64BIT(ctx);
     REQUIRE_INSNS_FLAGS2(ctx, ISA300);
 #if defined(TARGET_PPC64)
-    return do_ld_st_vl(ctx, a, gen_helper_LXVL);
+    return do_ld_st_vl(ctx, a, gen_helper_LXVL, false, false);
 #else
     qemu_build_not_reached();
 #endif
@@ -344,7 +410,7 @@ static bool trans_LXVLL(DisasContext *ctx, arg_LXVLL *a)
     REQUIRE_64BIT(ctx);
     REQUIRE_INSNS_FLAGS2(ctx, ISA300);
 #if defined(TARGET_PPC64)
-    return do_ld_st_vl(ctx, a, gen_helper_LXVLL);
+    return do_ld_st_vl(ctx, a, gen_helper_LXVLL, false, true);
 #else
     qemu_build_not_reached();
 #endif
@@ -356,7 +422,7 @@ static bool trans_STXVL(DisasContext *ctx, arg_STXVL *a)
     REQUIRE_64BIT(ctx);
     REQUIRE_INSNS_FLAGS2(ctx, ISA300);
 #if defined(TARGET_PPC64)
-    return do_ld_st_vl(ctx, a, gen_helper_STXVL);
+    return do_ld_st_vl(ctx, a, gen_helper_STXVL, true, false);
 #else
     qemu_build_not_reached();
 #endif
@@ -368,7 +434,7 @@ static bool trans_STXVLL(DisasContext *ctx, arg_STXVLL *a)
     REQUIRE_64BIT(ctx);
     REQUIRE_INSNS_FLAGS2(ctx, ISA300);
 #if defined(TARGET_PPC64)
-    return do_ld_st_vl(ctx, a, gen_helper_STXVLL);
+    return do_ld_st_vl(ctx, a, gen_helper_STXVLL, true, true);
 #else
     qemu_build_not_reached();
 #endif

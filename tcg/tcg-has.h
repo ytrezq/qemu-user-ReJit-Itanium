@@ -51,5 +51,8 @@
 #ifndef TCG_TARGET_HAS_perm2b_vec
 #define TCG_TARGET_HAS_perm2b_vec       0
 #endif
+#ifndef TCG_TARGET_HAS_ldstm_vec
+#define TCG_TARGET_HAS_ldstm_vec        0
+#endif
 
 #endif

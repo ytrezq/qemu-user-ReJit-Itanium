@@ -844,6 +844,24 @@ void tcg_gen_fpcmpcc_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
               tcgv_vec_arg(a), tcgv_vec_arg(b), fpop);
 }
 
+void tcg_gen_ldm_vec(TCGv_vec r, TCGv_ptr ptr, TCGv_i64 mask)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(tcg_can_emit_ldstm(rt->base_type));
+    vec_gen_3(INDEX_op_ldm_vec, rt->base_type, MO_8, temp_arg(rt),
+              tcgv_ptr_arg(ptr), tcgv_i64_arg(mask));
+}
+
+void tcg_gen_stm_vec(TCGv_vec v, TCGv_ptr ptr, TCGv_i64 mask)
+{
+    TCGTemp *vt = tcgv_vec_temp(v);
+
+    tcg_debug_assert(tcg_can_emit_ldstm(vt->base_type));
+    vec_gen_3(INDEX_op_stm_vec, vt->base_type, MO_8, temp_arg(vt),
+              tcgv_ptr_arg(ptr), tcgv_i64_arg(mask));
+}
+
 void tcg_gen_perm2b_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx)
 {
     TCGTemp *rt = tcgv_vec_temp(r);

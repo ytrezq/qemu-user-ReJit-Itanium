@@ -2474,6 +2474,9 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_fpop_vec;
     case INDEX_op_perm2b_vec:
         return has_type && TCG_TARGET_HAS_perm2b_vec;
+    case INDEX_op_ldm_vec:
+    case INDEX_op_stm_vec:
+        return has_type && TCG_TARGET_HAS_ldstm_vec;
 
     default:
         if (op < INDEX_op_last_generic) {
@@ -2519,6 +2522,11 @@ bool tcg_can_emit_fpop(unsigned fpop, TCGType type, unsigned vece)
 bool tcg_can_emit_perm2b(TCGType type)
 {
     return tcg_op_supported(INDEX_op_perm2b_vec, type, 0);
+}
+
+bool tcg_can_emit_ldstm(TCGType type)
+{
+    return tcg_op_supported(INDEX_op_ldm_vec, type, 0);
 }
 
 bool tcg_op_deposit_valid(TCGType type, unsigned ofs, unsigned len)

@@ -950,6 +950,7 @@ int tcg_can_emit_vec_op(TCGOpcode, TCGType, unsigned);
 /* Host floating point and byte permute ops, see tcg/tcg-fpop.h */
 bool tcg_can_emit_fpop(unsigned fpop, TCGType type, unsigned vece);
 bool tcg_can_emit_perm2b(TCGType type);
+bool tcg_can_emit_ldstm(TCGType type);
 
 /* Expand the tuple (opc, type, vece) on the given arguments.  */
 void tcg_expand_vec_op(TCGOpcode, TCGType, unsigned, TCGArg, ...);

@@ -189,6 +189,14 @@ DEF(fpcmpcc_vec, 1, 2, 1, TCG_OPF_VECTOR)
  * d[i] = (a:b)[idx[i] & 31], in host element order.
  */
 DEF(perm2b_vec, 1, 3, 0, TCG_OPF_VECTOR)
+/*
+ * Masked access to host memory, for user-mode guest accesses: the bytes
+ * of the vector whose bit is set in the i64 mask (bit i for byte i, in
+ * host order) are loaded from or stored to ptr + i, and a load zeroes the
+ * others.  Bytes outside the mask are not accessed, so they cannot fault.
+ */
+DEF(ldm_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_SIDE_EFFECTS)
+DEF(stm_vec, 0, 3, 0, TCG_OPF_VECTOR | TCG_OPF_SIDE_EFFECTS)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

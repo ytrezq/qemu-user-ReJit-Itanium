@@ -510,6 +510,8 @@ void tcg_gen_fpop3_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
 void tcg_gen_fpcmpcc_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
                          unsigned fpop);
 void tcg_gen_perm2b_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx);
+void tcg_gen_ldm_vec(TCGv_vec r, TCGv_ptr ptr, TCGv_i64 mask);
+void tcg_gen_stm_vec(TCGv_vec v, TCGv_ptr ptr, TCGv_i64 mask);
 
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);

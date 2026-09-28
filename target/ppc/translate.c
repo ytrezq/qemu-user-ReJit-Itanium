@@ -25,6 +25,9 @@
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
 #include "tcg/tcg-fpop.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/guest-base.h"
+#endif
 #include "qemu/host-utils.h"
 
 #include "exec/helper-proto.h"

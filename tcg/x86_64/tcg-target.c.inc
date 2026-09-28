@@ -3933,6 +3933,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_N1_I3(x, x, x, x);
     case INDEX_op_fpcmpcc_vec:
         return C_O1_I2(r, x, x);
+    case INDEX_op_ldm_vec:
+        return C_O1_I2(x, r, r);
+    case INDEX_op_stm_vec:
+        return C_O0_I3(x, r, r);
 
     default:
         return C_NotImplemented;
