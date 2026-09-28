@@ -419,7 +419,20 @@ struct TCGContext {
      */
     bool carry_live;
 
-    GHashTable *const_table[TCG_TYPE_COUNT];
+    /*
+     * The constant temps of the TB by type and value, in open addressing:
+     * an entry of another generation than const_gen is free, so that
+     * tcg_func_start forgets them all at once (a GHashTable emptied for
+     * each TB shrank, then grew again with its constants: 5 to 8% of the
+     * time of the programs that are mostly translation).  Never more than
+     * TCG_MAX_TEMPS entries in use: half the table at most.
+     */
+#define TCG_CONST_HASH_BITS 10
+    uint32_t const_gen;
+    struct {
+        uint32_t gen;
+        uint32_t idx;
+    } const_hash[1 << TCG_CONST_HASH_BITS];
     TCGTempSet free_temps[TCG_TYPE_COUNT];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */
 

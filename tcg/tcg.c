@@ -1967,10 +1967,9 @@ void tcg_func_start(TCGContext *s)
     tcg_temp_ebb_reset_freed(s);
 
     /* No constant temps have been previously allocated. */
-    for (int i = 0; i < TCG_TYPE_COUNT; ++i) {
-        if (s->const_table[i]) {
-            g_hash_table_remove_all(s->const_table[i]);
-        }
+    if (++s->const_gen == 0) {
+        memset(s->const_hash, 0, sizeof(s->const_hash));
+        s->const_gen = 1;
     }
 
     s->nb_ops = 0;
@@ -2279,25 +2278,35 @@ void tcg_temp_free_vec(TCGv_vec arg)
 TCGTemp *tcg_constant_internal(TCGType type, int64_t val)
 {
     TCGContext *s = tcg_ctx;
-    GHashTable *h = s->const_table[type];
+    const unsigned mask = (1u << TCG_CONST_HASH_BITS) - 1;
+    uint32_t gen = s->const_gen;
+    unsigned i;
     TCGTemp *ts;
 
-    if (h == NULL) {
-        h = g_hash_table_new(g_int64_hash, g_int64_equal);
-        s->const_table[type] = h;
+    if (unlikely(gen == 0)) {
+        /* before the first tcg_func_start: no entry is of generation 1 */
+        gen = s->const_gen = 1;
+    }
+    i = (((uint64_t)val ^ ((uint64_t)type << 56)) * 0x9e3779b97f4a7c15ull)
+        >> (64 - TCG_CONST_HASH_BITS);
+    for (;; i = (i + 1) & mask) {
+        if (s->const_hash[i].gen != gen) {
+            break;
+        }
+        ts = &s->temps[s->const_hash[i].idx];
+        if (ts->val == val && ts->base_type == type) {
+            return ts;
+        }
     }
 
-    ts = g_hash_table_lookup(h, &val);
-    if (ts == NULL) {
-        ts = tcg_temp_alloc(s);
-        ts->base_type = type;
-        ts->type = type;
-        ts->kind = TEMP_CONST;
-        ts->temp_allocated = 1;
-        ts->val = val;
-        g_hash_table_insert(h, &ts->val, ts);
-    }
-
+    ts = tcg_temp_alloc(s);
+    ts->base_type = type;
+    ts->type = type;
+    ts->kind = TEMP_CONST;
+    ts->temp_allocated = 1;
+    ts->val = val;
+    s->const_hash[i].gen = gen;
+    s->const_hash[i].idx = ts - s->temps;
     return ts;
 }
 
