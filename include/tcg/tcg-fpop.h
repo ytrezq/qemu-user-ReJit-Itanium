@@ -14,8 +14,10 @@
  * Front ends must only use these ops when tcg_can_emit_fpop() says so,
  * and fall back to their helpers otherwise.
  *
- * Element types: vece MO_32 (binary32) or MO_64 (binary64).  For
- * TCG_TYPE_V64 with MO_64 the op works on a single scalar element.
+ * Element types: vece MO_32 (binary32) or MO_64 (binary64).  With
+ * TCG_TYPE_V64 the op works on a single scalar element (lane 0); for MO_32
+ * the other 32 bits of the V64 result are zero, as a write of a single
+ * register zero-extends it on Arm.
  * Lanes outside the TCG type never raise exceptions.
  *
  * NaN results: a NaN operand propagates quieted; with several NaN operands
@@ -38,6 +40,8 @@ typedef enum TCGFPOp {
     TCG_FPOP_CMP,       /* all-ones element mask if TCG_FPOP_PRED holds */
     TCG_FPOP_MAXNUM,    /* IEEE 754-2008 maxNum: -0 < +0, a quiet NaN loses */
     TCG_FPOP_MINNUM,    /* IEEE 754-2008 minNum */
+    TCG_FPOP_MAX,       /* IEEE 754-2019 maximum: -0 < +0, NaNs propagate */
+    TCG_FPOP_MIN,       /* IEEE 754-2019 minimum */
 
     /* fpop1_vec d, a */
     TCG_FPOP_SQRT,
@@ -52,6 +56,10 @@ typedef enum TCGFPOp {
     TCG_FPOP_CVTI_U,    /* fp -> unsigned integer element, saturating */
     TCG_FPOP_CVTI_S32,  /* MO_64: binary64 -> int32, sign-extended to 64 */
     TCG_FPOP_CVTI_U32,  /* MO_64: binary64 -> uint32, zero-extended to 64 */
+    TCG_FPOP_CVTI_S64,  /* MO_32, scalar: binary32 -> int64 */
+    TCG_FPOP_CVTI_U64,  /* MO_32, scalar: binary32 -> uint64 */
+    TCG_FPOP_CVT_F64,   /* MO_32, scalar: binary32 -> binary64 */
+    TCG_FPOP_CVT_F32,   /* MO_64, scalar: binary64 -> binary32 (MO_32 result) */
 
     /* fpop3_vec d, a, b, c */
     TCG_FPOP_FMA,       /* d = a * b + c, single rounding */
@@ -90,6 +98,19 @@ typedef enum TCGFPOp {
 #define TCG_FPOP_F_SIGNAL       (1u << 16)
 /* CVTI_S32, CVTI_U32: the 32-bit result in both halves of the element. */
 #define TCG_FPOP_F_DUP32        (1u << 17)
+/*
+ * Arm NaN propagation (FPProcessNaNs, FPProcessNaNs3): signalling NaNs
+ * take priority over quiet ones, then operand order, which for FMA is
+ * c (the addend), a, b; and 0 * inf + a quiet NaN is an invalid operation
+ * that gives the default NaN.  Also for MAX, MIN, MAXNUM and MINNUM.
+ */
+#define TCG_FPOP_F_SNAN_FIRST   (1u << 18)
+/* CVT_S, CVT_U of MO_64 integers: binary32 result, as with MO_32 */
+#define TCG_FPOP_F_RES32        (1u << 19)
+/* CVTI_*: a NaN converts to 0 (Arm) */
+#define TCG_FPOP_F_NAN_ZERO     (1u << 27)
+/* fpcmpcc_vec: Arm NZCV in bits 31..28 instead of TCG_FPCC_* */
+#define TCG_FPOP_F_CC_NZCV      (1u << 28)
 
 /* CMP predicates */
 typedef enum TCGFPPred {
@@ -126,6 +147,45 @@ typedef enum TCGFPRound {
 #define TCG_FPCC_GT             4
 #define TCG_FPCC_EQ             2
 #define TCG_FPCC_UN             1
+
+/*
+ * The host exception flags, where the fpops accumulate theirs, in a
+ * portable encoding; tcg_host_fpexc_clear() clears them.
+ */
+#define TCG_FPEXC_INVALID       1
+#define TCG_FPEXC_DIVZERO       2
+#define TCG_FPEXC_OVERFLOW      4
+#define TCG_FPEXC_UNDERFLOW     8
+#define TCG_FPEXC_INEXACT       16
+
+#if defined(__x86_64__)
+static inline unsigned tcg_host_fpexc_get(void)
+{
+    uint32_t m;
+    asm volatile("stmxcsr %0" : "=m"(m));
+    /* MXCSR: IE 0x01, DE 0x02, ZE 0x04, OE 0x08, UE 0x10, PE 0x20 */
+    return (m & 1) | ((m >> 1) & 0x1e);
+}
+
+static inline void tcg_host_fpexc_clear(void)
+{
+    uint32_t m;
+    asm volatile("stmxcsr %0" : "=m"(m));
+    if (m & 0x3f) {
+        m &= ~0x3fu;
+        asm volatile("ldmxcsr %0" : : "m"(m));
+    }
+}
+#else
+static inline unsigned tcg_host_fpexc_get(void)
+{
+    return 0;
+}
+
+static inline void tcg_host_fpexc_clear(void)
+{
+}
+#endif
 
 /*
  * Host C code, e.g. glib in the translator itself, may raise host FP

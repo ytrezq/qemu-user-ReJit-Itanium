@@ -3949,6 +3949,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I2(x, r, r);
     case INDEX_op_stm_vec:
         return C_O0_I3(x, r, r);
+    case INDEX_op_st32_vec:
+        return C_O0_I2(x, r);
 
     default:
         return C_NotImplemented;

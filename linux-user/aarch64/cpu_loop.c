@@ -26,6 +26,7 @@
 #include "semihosting/common-semi.h"
 #include "target/arm/syndrome.h"
 #include "target/arm/cpu-features.h"
+#include "tcg/tcg-fpop.h"
 
 /* Use the exception syndrome to map a cpu exception to a signal. */
 static void signal_for_exception(CPUARMState *env, vaddr addr)
@@ -159,6 +160,7 @@ void cpu_loop(CPUARMState *env)
     CPUState *cs = env_cpu(env);
     int trapnr;
     abi_long ret;
+    uint32_t fpenv;
 
     for (;;) {
         cpu_exec_start(cs);
@@ -170,6 +172,13 @@ void cpu_loop(CPUARMState *env)
         case EXCP_SWI:
             /* On syscall, PSTATE.ZA is preserved, PSTATE.SM is cleared. */
             aarch64_set_svcr(env, 0, R_SVCR_SM_MASK);
+            /*
+             * Make FPSR exact before e.g. clone() copies it or sigreturn
+             * replaces it, and do not let host code in the syscall leave
+             * host FP flags behind.
+             */
+            arm_fpj_sync(env);
+            fpenv = tcg_host_fpenv_save();
             ret = do_syscall(env,
                              env->xregs[8],
                              env->xregs[0],
@@ -179,6 +188,7 @@ void cpu_loop(CPUARMState *env)
                              env->xregs[4],
                              env->xregs[5],
                              0, 0);
+            tcg_host_fpenv_restore(fpenv);
             if (ret == -QEMU_ERESTARTSYS) {
                 env->pc -= 4;
             } else if (ret != -QEMU_ESIGRETURN && ret != -QEMU_ESETPC) {

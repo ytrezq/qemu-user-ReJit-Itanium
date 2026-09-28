@@ -24,6 +24,7 @@
 #include "cpu-features.h"
 #include "fpu/softfloat.h"
 #include "qemu/log.h"
+#include "tcg/tcg-fpop.h"
 
 /*
  * Set the float_status behaviour to match the Arm defaults:
@@ -137,7 +138,34 @@ uint32_t vfp_get_fpsr_from_host(CPUARMState *env)
         a64_flags &= ~float_flag_input_denormal_flushed;
     }
     return vfp_exceptbits_from_host(a64_flags, env->vfp.fpcr & FPCR_AH) |
-        vfp_exceptbits_from_host(a32_flags, false);
+        vfp_exceptbits_from_host(a32_flags, false) |
+        arm_fpj_host_fpsr(env);
+}
+
+/*
+ * FP instructions compiled to host FP code leave their exception flags
+ * in the host FP status register (see include/tcg/tcg-fpop.h), which
+ * belongs to the thread of this CPU: they are the IOC, DZC, OFC, UFC and
+ * IXC bits of FPSR, in that order (TCG_FPEXC_*), still to be folded in.
+ */
+QEMU_BUILD_BUG_ON(TCG_FPEXC_INVALID != FPSR_IOC ||
+                  TCG_FPEXC_DIVZERO != FPSR_DZC ||
+                  TCG_FPEXC_OVERFLOW != FPSR_OFC ||
+                  TCG_FPEXC_UNDERFLOW != FPSR_UFC ||
+                  TCG_FPEXC_INEXACT != FPSR_IXC);
+
+uint32_t arm_fpj_host_fpsr(CPUARMState *env)
+{
+    return env->vfp.fpj_host_off ? 0 : tcg_host_fpexc_get();
+}
+
+/* Fold the host FP flags into FPSR and clear them (before a syscall) */
+void arm_fpj_sync(CPUARMState *env)
+{
+    if (!env->vfp.fpj_host_off) {
+        env->vfp.fpsr |= tcg_host_fpexc_get();
+        tcg_host_fpexc_clear();
+    }
 }
 
 void vfp_clear_float_status_exc_flags(CPUARMState *env)
@@ -155,6 +183,9 @@ void vfp_clear_float_status_exc_flags(CPUARMState *env)
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_STD_F16]);
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_AH]);
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_AH_F16]);
+    if (!env->vfp.fpj_host_off) {
+        tcg_host_fpexc_clear();
+    }
 }
 
 static void vfp_sync_and_clear_float_status_exc_flags(CPUARMState *env)
@@ -260,6 +291,19 @@ void vfp_set_fpcr_to_host(CPUARMState *env, uint32_t val, uint32_t mask)
      */
     if (changed & (FPCR_FZ | FPCR_AH | FPCR_FIZ)) {
         vfp_sync_and_clear_float_status_exc_flags(env);
+    }
+    /*
+     * Leaving or entering the FPCR state that host FP code implements
+     * (the TB flag FPSOFT changes, see vfp_set_fpcr_masked): the host
+     * flags are folded into FPSR, then ignored until it is entered again,
+     * since helpers may leave flags there that must not reach FPSR
+     * (e.g. those of FPST_AH).
+     */
+    if (changed & ARM_FPJ_SOFT_MASK) {
+        uint64_t fpcr = (env->vfp.fpcr & ~(uint64_t)mask) | (val & mask);
+
+        arm_fpj_sync(env);
+        env->vfp.fpj_host_off = (fpcr & ARM_FPJ_SOFT_MASK) != 0;
     }
 }
 

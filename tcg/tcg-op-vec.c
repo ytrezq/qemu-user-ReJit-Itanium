@@ -275,6 +275,17 @@ void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr b, TCGArg o)
     vec_gen_ldst(INDEX_op_st_vec, r, b, o);
 }
 
+/* Store the low 32-bit element of r, see TCG_TARGET_HAS_fpop_vec */
+void tcg_gen_st32_vec(TCGv_vec r, TCGv_ptr b, TCGArg o)
+{
+    TCGArg ri = tcgv_vec_arg(r);
+    TCGArg bi = tcgv_ptr_arg(b);
+    TCGTemp *rt = arg_temp(ri);
+
+    tcg_debug_assert(tcg_op_supported(INDEX_op_st32_vec, rt->base_type, 0));
+    vec_gen_3(INDEX_op_st32_vec, rt->base_type, MO_32, ri, bi, o);
+}
+
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr b, TCGArg o, TCGType low_type)
 {
     TCGArg ri = tcgv_vec_arg(r);

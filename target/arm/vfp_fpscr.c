@@ -21,6 +21,7 @@
 #include "cpu.h"
 #include "internals.h"
 #include "cpu-features.h"
+#include "system/tcg.h"
 
 uint32_t vfp_get_fpcr(CPUARMState *env)
 {
@@ -94,6 +95,7 @@ static void vfp_set_fpcr_masked(CPUARMState *env, uint32_t val, uint32_t mask)
      * part of a field)
      */
     ARMCPU *cpu = env_archcpu(env);
+    uint64_t old_fpcr = env->vfp.fpcr;
 
     /* When ARMv8.2-FP16 is not supported, FZ16 is RES0.  */
     if (!cpu_isar_feature(any_fp16, cpu)) {
@@ -141,6 +143,11 @@ static void vfp_set_fpcr_masked(CPUARMState *env, uint32_t val, uint32_t mask)
         FPCR_EBF | FPCR_FIZ | FPCR_AH | FPCR_NEP;
     env->vfp.fpcr &= ~mask;
     env->vfp.fpcr |= val;
+
+    /* TB flag FPSOFT (AArch64 hflags; computed at lookup for AArch32) */
+    if (tcg_enabled() && ((old_fpcr ^ env->vfp.fpcr) & ARM_FPJ_SOFT_MASK)) {
+        arm_rebuild_hflags(env);
+    }
 }
 
 void vfp_set_fpcr(CPUARMState *env, uint32_t val)

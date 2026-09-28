@@ -28,6 +28,7 @@
 #include "exec/mmap-lock.h"
 #include "user/page-protection.h"
 #include "target/arm/syndrome.h"
+#include "tcg/tcg-fpop.h"
 
 #define get_user_code_u32(x, gaddr, env)                \
     ({ abi_long __r = get_user_u32((x), (gaddr));       \
@@ -388,6 +389,11 @@ void cpu_loop(CPUARMState *env)
                         break;
                     }
                 } else {
+                    /* see aarch64/cpu_loop.c */
+                    uint32_t fpenv;
+
+                    arm_fpj_sync(env);
+                    fpenv = tcg_host_fpenv_save();
                     ret = do_syscall(env,
                                      n,
                                      env->regs[0],
@@ -397,6 +403,7 @@ void cpu_loop(CPUARMState *env)
                                      env->regs[4],
                                      env->regs[5],
                                      0, 0);
+                    tcg_host_fpenv_restore(fpenv);
                     if (ret == -QEMU_ERESTARTSYS) {
                         env->regs[15] -= env->thumb ? 2 : 4;
                     } else if (ret != -QEMU_ESIGRETURN && ret != -QEMU_ESETPC) {

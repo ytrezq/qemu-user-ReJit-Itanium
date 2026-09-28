@@ -2966,6 +2966,7 @@ static bool fold_tcg_st(OptContext *ctx, TCGOp *op)
         lm1 = 1;
         break;
     case INDEX_op_st32:
+    case INDEX_op_st32_vec:
         lm1 = 3;
         break;
     case INDEX_op_st:
@@ -3156,6 +3157,7 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_st8:
         case INDEX_op_st16:
         case INDEX_op_st32:
+        case INDEX_op_st32_vec:
             done = fold_tcg_st(&ctx, op);
             break;
         case INDEX_op_st:

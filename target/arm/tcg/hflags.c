@@ -545,6 +545,9 @@ static CPUARMTBFlags rebuild_hflags_a64(CPUARMState *env, int el, int fp_el,
     if (env->vfp.fpcr & FPCR_AH) {
         DP_TBFLAG_A64(flags, AH, 1);
     }
+    if (env->vfp.fpcr & ARM_FPJ_SOFT_MASK) {
+        DP_TBFLAG_A64(flags, FPSOFT, 1);
+    }
     if (env->vfp.fpcr & FPCR_NEP) {
         /*
          * In streaming-SVE without FA64, NEP behaves as if zero;
@@ -724,6 +727,9 @@ TCGTBCPUState arm_get_tb_cpu_state(CPUState *cs)
             /* Note that VECLEN+VECSTRIDE are RES0 for M-profile. */
             DP_TBFLAG_A32(flags, VECLEN, env->vfp.vec_len);
             DP_TBFLAG_A32(flags, VECSTRIDE, env->vfp.vec_stride);
+            if (env->vfp.fpcr & ARM_FPJ_SOFT_MASK) {
+                DP_TBFLAG_A32(flags, FPSOFT, 1);
+            }
             if (env->vfp.xregs[ARM_VFP_FPEXC] & (1 << 30)) {
                 DP_TBFLAG_A32(flags, VFPEN, 1);
             }

@@ -2012,20 +2012,18 @@ static void gen_xxh64_round(TCGv_i64 acc, TCGv_i64 in, uint64_t acc0)
 static void gen_pac_hash(TCGv_i64 ret, TCGv_i64 data, TCGv_i64 mod,
                          intptr_t key_ofs)
 {
-    TCGv_i64 v[4], t = tcg_temp_ebb_new_i64();
+    TCGv_i64 v[4], t = tcg_temp_new_i64();
 
     if (pac_jit_mode() == 2) {
-        TCGv_i64 u = tcg_temp_ebb_new_i64();
+        TCGv_i64 u = tcg_temp_new_i64();
         tcg_gen_ld_i64(t, tcg_env, key_ofs + offsetof(ARMPACKey, lo));
         tcg_gen_ld_i64(u, tcg_env, key_ofs + offsetof(ARMPACKey, hi));
         gen_helper_pac_hash(ret, data, mod, t, u);
-        tcg_temp_free_i64(t);
-        tcg_temp_free_i64(u);
         return;
     }
 
     for (int i = 0; i < 4; i++) {
-        v[i] = tcg_temp_ebb_new_i64();
+        v[i] = tcg_temp_new_i64();
     }
     gen_xxh64_round(v[0], data,
                     QEMU_XXHASH_SEED + XXH_PRIME64_1 + XXH_PRIME64_2);
@@ -2059,11 +2057,6 @@ static void gen_pac_hash(TCGv_i64 ret, TCGv_i64 data, TCGv_i64 mod,
     tcg_gen_muli_i64(ret, ret, XXH_PRIME64_3);
     tcg_gen_shri_i64(t, ret, 32);
     tcg_gen_xor_i64(ret, ret, t);
-
-    tcg_temp_free_i64(t);
-    for (int i = 0; i < 4; i++) {
-        tcg_temp_free_i64(v[i]);
-    }
 }
 
 /*
@@ -2092,10 +2085,9 @@ static void gen_pac_op(DisasContext *s, TCGv_i64 dst, TCGv_i64 x,
 
     slow = gen_new_label();
     done = gen_new_label();
-    /* all dead at the labels: no TB-wide temps for the liveness passes */
-    base = tcg_temp_ebb_new_i64();
-    pac = tcg_temp_ebb_new_i64();
-    res = tcg_temp_ebb_new_i64();
+    base = tcg_temp_new_i64();
+    pac = tcg_temp_new_i64();
+    res = tcg_temp_new_i64();
 
     /* pointers of the upper address range: helper */
     tcg_gen_brcondi_i64(TCG_COND_TSTNE, x, 1ull << 55, slow);
@@ -2124,9 +2116,6 @@ static void gen_pac_op(DisasContext *s, TCGv_i64 dst, TCGv_i64 x,
     }
     tcg_gen_mov_i64(dst, res);
     tcg_gen_br(done);
-    tcg_temp_free_i64(base);
-    tcg_temp_free_i64(pac);
-    tcg_temp_free_i64(res);
 
     gen_set_label(slow);
     helper(dst, tcg_env, x, y);

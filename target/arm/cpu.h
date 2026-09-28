@@ -700,6 +700,16 @@ typedef struct CPUArchState {
 
         uint64_t zcr_el[4];   /* ZCR_EL[1-3] */
         uint64_t smcr_el[4];  /* SMCR_EL[1-3] */
+
+        /*
+         * FP instructions compiled to host FP code (TCG fpops, see
+         * translate-fpj.c.inc): a slot to move their results to integer
+         * registers, and whether the host FP exception flags are *not*
+         * the guest's, i.e. FPCR is outside the state that such code
+         * implements (ARM_FPJ_SOFT_MASK), in which case they are ignored.
+         */
+        uint64_t fpj_scratch;
+        bool fpj_host_off;
     } vfp;
 
     uint64_t exclusive_addr;
@@ -1871,6 +1881,14 @@ void vfp_set_fpscr(CPUARMState *env, uint32_t val);
 /* Cumulative exception trap enable bits */
 #define FPCR_EEXC_MASK (FPCR_IOE | FPCR_DZE | FPCR_OFE | FPCR_UFE | FPCR_IXE | FPCR_IDE)
 
+/*
+ * FP instructions are compiled to host FP code only with these FPCR bits
+ * clear: no flush to zero, no default NaN, round to nearest, no FEAT_AFP
+ * alternate behaviours (TB flag FPSOFT otherwise, and helpers are used).
+ */
+#define ARM_FPJ_SOFT_MASK (FPCR_FZ | FPCR_DN | FPCR_RMODE_MASK | \
+                           FPCR_AH | FPCR_FIZ | FPCR_NEP)
+
 /* FPSR bits */
 #define FPSR_IOC    (1 << 0)    /* Invalid Operation cumulative exception */
 #define FPSR_DZC    (1 << 1)    /* Divide by Zero cumulative exception */
@@ -1906,6 +1924,9 @@ QEMU_BUILD_BUG_ON(FPSCR_FPSR_MASK & FPSCR_FPCR_MASK);
  * Return the current AArch64 FPSR value
  */
 uint32_t vfp_get_fpsr(CPUARMState *env);
+/* FPSR flags of host FP code still in the host register; fold them in. */
+uint32_t arm_fpj_host_fpsr(CPUARMState *env);
+void arm_fpj_sync(CPUARMState *env);
 
 /**
  * vfp_get_fpcr: read the AArch64 FPCR
@@ -2499,6 +2520,8 @@ FIELD(TBFLAG_A32, NS, 10, 1)
  * This requires an SME trap from AArch32 mode when using NEON.
  */
 FIELD(TBFLAG_A32, SME_TRAP_NONSTREAMING, 11, 1)
+/* FPSCR outside ARM_FPJ_SOFT_MASK defaults: VFP insns use helpers. */
+FIELD(TBFLAG_A32, FPSOFT, 12, 1)            /* Not cached. */
 
 /*
  * Bit usage when in AArch32 state, for M-profile only.
@@ -2559,6 +2582,8 @@ FIELD(TBFLAG_A64, FPMR_EL, 45, 2)
 FIELD(TBFLAG_A64, MTE_STORE_ONLY, 47, 1)
 FIELD(TBFLAG_A64, MTE0_STORE_ONLY, 48, 1)
 FIELD(TBFLAG_A64, MTX, 49, 2)
+/* FPCR outside ARM_FPJ_SOFT_MASK defaults: FP insns use helpers. */
+FIELD(TBFLAG_A64, FPSOFT, 51, 1)
 
 /*
  * Helpers for using the above. Note that only the A64 accessors use
