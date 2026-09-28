@@ -143,6 +143,7 @@ static abi_long do_prctl_reset_keys(CPUArchState *env, abi_long arg2)
             ret |= qemu_guest_getrandom(&env->keys.apga,
                                         sizeof(ARMPACKey), &err);
         }
+        arm_pac_cache_reset(env);
         if (ret != 0) {
             /*
              * Some unknown failure in the crypto.  The best

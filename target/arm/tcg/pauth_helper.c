@@ -503,11 +503,59 @@ static bool pauth_key_enabled(CPUARMState *env, int el, uint32_t bit)
     return (arm_sctlr(env, el) & bit) != 0;
 }
 
-/* The IMPDEF PAC alone, for the generated code of translate-a64.c */
-uint64_t HELPER(pac_hash)(uint64_t data, uint64_t modifier,
-                          uint64_t key_lo, uint64_t key_hi)
+/*
+ * The slow paths of gen_pac_op_cached() in translate-a64.c (user mode):
+ * the PACxx or AUTxx instruction of key (0: IA, 1: IB, 2: DA, 3: DB)
+ * desc & 3, AUTxx combined with a branch or load if desc & 4, for a PAC
+ * field [desc >> 8, 55); remember its result in env->pac_cache if the
+ * pointer has a zero PAC field, or is the valid PAC of one.
+ */
+uint64_t HELPER(pac_fill)(CPUARMState *env, uint64_t x, uint64_t y,
+                          uint32_t desc)
 {
-    return qemu_xxhash64_4(data, modifier, key_lo, key_hi);
+    int key = desc & 3, bot = desc >> 8;
+    ARMPACKey *k = &env->keys.apia + key;
+    ARMPACCacheEntry *e;
+    uint64_t r;
+
+    QEMU_BUILD_BUG_ON(offsetof(CPUARMState, keys.apdb)
+                      != offsetof(CPUARMState, keys.apia)
+                         + 3 * sizeof(ARMPACKey));
+    if (x & MAKE_64BIT_MASK(bot, 56 - bot)) {
+        return pauth_addpac(env, x, y, k, key >= 2);
+    }
+    /* pauth_addpac() of a pointer with good extension bits, TBI, !MTX */
+    r = x | (pauth_computepac(env, x, y, *k) & MAKE_64BIT_MASK(bot, 55 - bot));
+    e = &env->pac_cache[key][arm_pac_cache_idx(x, y)];
+    e->ptr = x;
+    e->mod = y;
+    e->pac = r;
+    return r;
+}
+
+uint64_t HELPER(aut_fill)(CPUARMState *env, uint64_t x, uint64_t y,
+                          uint32_t desc)
+{
+    int key = desc & 3, bot = desc >> 8;
+    ARMPACKey *k = &env->keys.apia + key;
+
+    if (!(x & (1ull << 55))) {
+        /* pauth_auth() of a lower range pointer, TBI, !MTX: success? */
+        uint64_t orig = x & ~MAKE_64BIT_MASK(bot, 56 - bot);
+        uint64_t pac = pauth_computepac(env, orig, y, *k);
+
+        if (!((pac ^ x) & MAKE_64BIT_MASK(bot, 55 - bot))) {
+            ARMPACCacheEntry *e =
+                &env->pac_cache[key][arm_pac_cache_idx(orig, y)];
+
+            e->ptr = orig;
+            e->mod = y;
+            e->pac = x;
+            return orig;
+        }
+    }
+    /* failure, with its FPAC exception or error code */
+    return pauth_auth(env, x, y, k, key >= 2, key & 1, GETPC(), desc & 4);
 }
 
 uint64_t HELPER(pacia)(CPUARMState *env, uint64_t x, uint64_t y)

@@ -262,5 +262,6 @@ void init_main_thread(CPUState *cs, struct image_info *info)
 
     if (cpu_isar_feature(aa64_pauth, cpu)) {
         qemu_guest_getrandom_nofail(&env->keys, sizeof(env->keys));
+        arm_pac_cache_reset(env);
     }
 }

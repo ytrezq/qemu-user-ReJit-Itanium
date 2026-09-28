@@ -1963,20 +1963,24 @@ static bool trans_RET(DisasContext *s, arg_r *a)
  * pauth_addpac() and pauth_auth() cost a helper call, the parsing of
  * TCR (aa64_va_parameters) and the PAC itself at every function entry
  * and return of code built with -mbranch-protection (PACIASP/AUTIASP).
- * With the IMPDEF algorithm, the PAC is qemu_xxhash64_4(ptr, modifier,
- * key.lo, key.hi), a few multiplies and rotates: do the whole operation
- * in generated code for pointers whose bit 55 is clear, i.e. all user
- * addresses, with the same FEAT_PAuth2 rules; the helpers remain the slow
- * path for everything else and raise the FPAC exception of a failed
- * authentication.
+ * In user mode, TCR and SCTLR never change and the keys only change with
+ * PR_PAC_RESET_KEYS, so PAC(p, m) is a pure function of the pointer and
+ * the modifier.  For the pointers of the lower address range, i.e. all
+ * user addresses, with the PAC field [bot, 55) below the top byte (TBI):
  *
- * QEMU_PAUTH_JIT selects how the hash itself is done:
- *   2 (default): call helper_pac_hash(), a leaf function of its four
- *     arguments that touches no CPU state, so no globals are spilled;
- *   1: fully inline, about 60 TCG ops per PAC instruction, which runs no
- *     faster (the call is hidden by out-of-order execution) but costs
- *     translation time that short-lived processes notice;
- *   0: the original helpers.
+ * QEMU_PAUTH_JIT=2 (default): env->pac_cache[key] remembers pointers p
+ *   whose PAC field is zero, modifiers m and PAC(p, m), and the generated
+ *   code looks them up: PACxx of (p, m) gives PAC(p, m), AUTxx of
+ *   (PAC(p, m), m) gives p.  So the AUTIASP of a return finds the entry
+ *   of the PACIASP of its function entry, and a function called in a loop
+ *   finds the previous call.  On a miss, helper_pac_fill() or
+ *   helper_aut_fill() does the instruction, with its exception, and fills
+ *   the entry.  This works with any PAC algorithm.
+ * QEMU_PAUTH_JIT=1: the IMPDEF PAC (qemu_xxhash64_4) fully inline, about
+ *   60 TCG ops per instruction, which costs translation time and runs
+ *   slower; FEAT_PAuth2 only.
+ * QEMU_PAUTH_JIT=0: the original helpers.
+ * The helpers remain the slow path for everything else.
  */
 enum { PAC_KEY_IA, PAC_KEY_IB, PAC_KEY_DA, PAC_KEY_DB };
 
@@ -2013,16 +2017,9 @@ static void gen_xxh64_round(TCGv_i64 acc, TCGv_i64 in, uint64_t acc0)
 static void gen_pac_hash(TCGv_i64 ret, TCGv_i64 data, TCGv_i64 mod,
                          intptr_t key_ofs)
 {
-    TCGv_i64 v[4], t = tcg_temp_new_i64();
+    TCGv_i64 v[4], t;
 
-    if (pac_jit_mode() == 2) {
-        TCGv_i64 u = tcg_temp_new_i64();
-        tcg_gen_ld_i64(t, tcg_env, key_ofs + offsetof(ARMPACKey, lo));
-        tcg_gen_ld_i64(u, tcg_env, key_ofs + offsetof(ARMPACKey, hi));
-        gen_helper_pac_hash(ret, data, mod, t, u);
-        return;
-    }
-
+    t = tcg_temp_new_i64();
     for (int i = 0; i < 4; i++) {
         v[i] = tcg_temp_new_i64();
     }
@@ -2060,35 +2057,16 @@ static void gen_pac_hash(TCGv_i64 ret, TCGv_i64 data, TCGv_i64 mod,
     tcg_gen_xor_i64(ret, ret, t);
 }
 
-/*
- * dst = the PAC instruction of @helper (PACxx, AUTxx or a combined AUTxx
- * if @combined) on pointer x with modifier y.
- */
-static void gen_pac_op(DisasContext *s, TCGv_i64 dst, TCGv_i64 x,
-                       TCGv_i64 y, int key, bool aut, bool combined,
-                       PacHelperFn *helper)
+/* QEMU_PAUTH_JIT=1 */
+static void gen_pac_op_inline(DisasContext *s, TCGv_i64 dst, TCGv_i64 x,
+                              TCGv_i64 y, int key, bool aut, bool combined,
+                              PacHelperFn *helper, int bot)
 {
-    static const intptr_t key_ofs[] = {
-        [PAC_KEY_IA] = offsetof(CPUARMState, keys.apia),
-        [PAC_KEY_IB] = offsetof(CPUARMState, keys.apib),
-        [PAC_KEY_DA] = offsetof(CPUARMState, keys.apda),
-        [PAC_KEY_DB] = offsetof(CPUARMState, keys.apdb),
-    };
-    int bot = s->pac_bot[key >= PAC_KEY_DA];
-    TCGLabel *slow, *done;
-    TCGv_i64 base, pac, res;
-    uint64_t field;
-
-    if (!bot || !(s->pac_keys & (1 << key))) {
-        helper(dst, tcg_env, x, y);
-        return;
-    }
-
-    slow = gen_new_label();
-    done = gen_new_label();
-    base = tcg_temp_new_i64();
-    pac = tcg_temp_new_i64();
-    res = tcg_temp_new_i64();
+    TCGLabel *slow = gen_new_label(), *done = gen_new_label();
+    TCGv_i64 base = tcg_temp_new_i64();
+    TCGv_i64 pac = tcg_temp_new_i64();
+    TCGv_i64 res = tcg_temp_new_i64();
+    uint64_t field = MAKE_64BIT_MASK(bot, 55 - bot);
 
     /* pointers of the upper address range: helper */
     tcg_gen_brcondi_i64(TCG_COND_TSTNE, x, 1ull << 55, slow);
@@ -2098,8 +2076,8 @@ static void gen_pac_op(DisasContext *s, TCGv_i64 dst, TCGv_i64 x,
      * from bit 55 (pauth_addpac) or restored (pauth_original_ptr).
      */
     tcg_gen_andi_i64(base, x, ~MAKE_64BIT_MASK(bot, 56 - bot));
-    gen_pac_hash(pac, base, y, key_ofs[key]);
-    field = MAKE_64BIT_MASK(bot, 55 - bot);
+    gen_pac_hash(pac, base, y,
+                 offsetof(CPUARMState, keys.apia) + key * sizeof(ARMPACKey));
     if (!aut) {
         /* FEAT_PAuth2: the code is xored with the pointer bits */
         tcg_gen_xor_i64(pac, pac, x);
@@ -2121,6 +2099,77 @@ static void gen_pac_op(DisasContext *s, TCGv_i64 dst, TCGv_i64 x,
     gen_set_label(slow);
     helper(dst, tcg_env, x, y);
     gen_set_label(done);
+}
+
+/*
+ * QEMU_PAUTH_JIT=2: one lookup and one branch per instruction.  The
+ * index of arm_pac_cache_idx() is that of the pointer with or without
+ * its PAC; a pointer of the upper range, a pointer with a wrong PAC
+ * or anything else unknown just misses.
+ */
+static void gen_pac_op_cached(DisasContext *s, TCGv_i64 dst, TCGv_i64 x,
+                              TCGv_i64 y, int key, bool aut, bool combined,
+                              int bot)
+{
+    intptr_t ofs = offsetof(CPUARMState, pac_cache)
+                   + key * sizeof(((CPUARMState *)0)->pac_cache[0]);
+    intptr_t in = aut ? offsetof(ARMPACCacheEntry, pac)
+                      : offsetof(ARMPACCacheEntry, ptr);
+    intptr_t out = aut ? offsetof(ARMPACCacheEntry, ptr)
+                       : offsetof(ARMPACCacheEntry, pac);
+    TCGv_i32 desc = tcg_constant_i32(key | combined << 2 | bot << 8);
+    TCGLabel *miss = gen_new_label(), *done = gen_new_label();
+    TCGv_i64 h = tcg_temp_new_i64(), t = tcg_temp_new_i64();
+    TCGv_ptr e = tcg_temp_new_ptr();
+
+    QEMU_BUILD_BUG_ON(sizeof(ARMPACCacheEntry) != 32);
+    /* e = &env->pac_cache[key][arm_pac_cache_idx(x, y)] */
+    tcg_gen_shri_i64(h, x, 2);
+    tcg_gen_shri_i64(t, x, 11);
+    tcg_gen_xor_i64(h, h, t);
+    tcg_gen_shri_i64(t, y, 4);
+    tcg_gen_xor_i64(h, h, t);
+    tcg_gen_andi_i64(h, h, ARM_PAC_CACHE_SIZE - 1);
+    tcg_gen_shli_i64(h, h, 5);
+    tcg_gen_trunc_i64_ptr(e, h);
+    tcg_gen_add_ptr(e, e, tcg_env);
+
+    /* hit: x == e->ptr (PAC) or e->pac (AUT), and y == e->mod */
+    tcg_gen_ld_i64(h, e, ofs + in);
+    tcg_gen_xor_i64(h, h, x);
+    tcg_gen_ld_i64(t, e, ofs + offsetof(ARMPACCacheEntry, mod));
+    tcg_gen_xor_i64(t, t, y);
+    tcg_gen_or_i64(h, h, t);
+    tcg_gen_brcondi_i64(TCG_COND_NE, h, 0, miss);
+    tcg_gen_ld_i64(dst, e, ofs + out);
+    tcg_gen_br(done);
+
+    gen_set_label(miss);
+    if (aut) {
+        gen_helper_aut_fill(dst, tcg_env, x, y, desc);
+    } else {
+        gen_helper_pac_fill(dst, tcg_env, x, y, desc);
+    }
+    gen_set_label(done);
+}
+
+/*
+ * dst = the PAC instruction of @helper (PACxx, AUTxx or a combined AUTxx
+ * if @combined) on pointer x with modifier y.
+ */
+static void gen_pac_op(DisasContext *s, TCGv_i64 dst, TCGv_i64 x,
+                       TCGv_i64 y, int key, bool aut, bool combined,
+                       PacHelperFn *helper)
+{
+    int bot = s->pac_bot[key >= PAC_KEY_DA];
+
+    if (!bot || !(s->pac_keys & (1 << key))) {
+        helper(dst, tcg_env, x, y);
+    } else if (pac_jit_mode() == 1) {
+        gen_pac_op_inline(s, dst, x, y, key, aut, combined, helper, bot);
+    } else {
+        gen_pac_op_cached(s, dst, x, y, key, aut, combined, bot);
+    }
 }
 
 static TCGv_i64 auth_branch_target(DisasContext *s, TCGv_i64 dst,
@@ -11584,15 +11633,17 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
      * mode, so the PAC field layout and the enabled keys are constants.
      */
     if (dc->pauth_active && pac_jit_enabled()
-        && cpu_isar_feature(pauth_feature, arm_cpu) >= PauthFeat_2
-        && !cpu_isar_feature(aa64_pauth_qarma5, arm_cpu)
-        && !cpu_isar_feature(aa64_pauth_qarma3, arm_cpu)) {
+        && (pac_jit_mode() != 1
+            || (cpu_isar_feature(pauth_feature, arm_cpu) >= PauthFeat_2
+                && !cpu_isar_feature(aa64_pauth_qarma5, arm_cpu)
+                && !cpu_isar_feature(aa64_pauth_qarma3, arm_cpu)))) {
         ARMMMUIdx s1 = arm_stage1_mmu_idx(env);
         uint64_t sctlr = arm_sctlr(env, 0);
 
         for (int data = 0; data < 2; data++) {
             ARMVAParameters p = aa64_va_parameters(env, 0, s1, data, false);
-            if (p.tbi && !p.mtx && p.tsz > 8 && p.tsz < 64) {
+            /* PAC field [bot, 55); arm_pac_cache_idx() uses bits 2..16 */
+            if (p.tbi && !p.mtx && p.tsz > 8 && p.tsz <= 64 - 17) {
                 dc->pac_bot[data] = 64 - p.tsz;
             }
         }

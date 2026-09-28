@@ -146,6 +146,18 @@ typedef struct ARMPACKey {
     uint64_t lo, hi;
 } ARMPACKey;
 
+/*
+ * User mode: pointer authentication codes remembered for the generated
+ * code, see gen_pac_op_cached() in translate-a64.c.  An entry holds a
+ * pointer whose PAC field is zero, a modifier and the pointer with its PAC.
+ */
+#define ARM_PAC_CACHE_BITS 6
+#define ARM_PAC_CACHE_SIZE (1 << ARM_PAC_CACHE_BITS)
+
+typedef struct ARMPACCacheEntry {
+    uint64_t ptr, mod, pac, pad;
+} ARMPACCacheEntry;
+
 /* See the commentary above the TBFLAG field definitions.  */
 typedef struct CPUARMTBFlags {
     uint32_t flags;
@@ -731,6 +743,13 @@ typedef struct CPUArchState {
         ARMPACKey apga;
     } keys;
 
+    /*
+     * User mode: the PACs last computed by the keys IA, IB, DA, DB, at
+     * index arm_pac_cache_idx(); reset by arm_pac_cache_reset() whenever
+     * the keys change.
+     */
+    ARMPACCacheEntry pac_cache[4][ARM_PAC_CACHE_SIZE];
+
     uint64_t scxtnum_el[4];
 
     struct {
@@ -835,6 +854,29 @@ typedef struct CPUArchState {
     bool tagged_addr_enable;
 #endif /* CONFIG_USER_ONLY */
 } CPUARMState;
+
+/*
+ * The index of a pointer and modifier in env->pac_cache[key], from bits
+ * of the pointer below its PAC field, so that it is also the index of
+ * the pointer with its PAC.
+ */
+static inline unsigned arm_pac_cache_idx(uint64_t ptr, uint64_t modifier)
+{
+    return ((ptr >> 2) ^ (ptr >> 11) ^ (modifier >> 4))
+           & (ARM_PAC_CACHE_SIZE - 1);
+}
+
+/*
+ * Empty all entries: all zeros, except the modifier of index 0, so that
+ * no entry has the index of its own contents and no lookup can find it.
+ */
+static inline void arm_pac_cache_reset(CPUARMState *env)
+{
+    memset(env->pac_cache, 0, sizeof(env->pac_cache));
+    for (int k = 0; k < ARRAY_SIZE(env->pac_cache); k++) {
+        env->pac_cache[k][0].mod = 1 << 4;
+    }
+}
 
 static inline void set_feature(CPUARMState *env, int feature)
 {
