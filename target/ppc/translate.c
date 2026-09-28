@@ -3651,6 +3651,20 @@ static inline bool use_goto_tb(DisasContext *ctx, target_ulong dest)
     return translator_use_goto_tb(&ctx->base, dest);
 }
 
+/*
+ * Indirect branch to the TB at cpu_nip: probe the jump cache in generated
+ * code (key = nip + hflags, see ppc_get_tb_cpu_state) and only call
+ * helper_lookup_tb_ptr on a miss.
+ */
+static void gen_lookup_and_goto_ptr_cached(void)
+{
+#if defined(TARGET_PPC64)
+    tcg_gen_lookup_and_goto_ptr_cached(cpu_nip, offsetof(CPUPPCState, hflags));
+#else
+    tcg_gen_lookup_and_goto_ptr();
+#endif
+}
+
 static void gen_lookup_and_goto_ptr(DisasContext *ctx)
 {
     if (unlikely(ctx->singlestep_flags)) {
@@ -3664,7 +3678,7 @@ static void gen_lookup_and_goto_ptr(DisasContext *ctx)
             pmu_count_insns(ctx);
         }
 
-        tcg_gen_lookup_and_goto_ptr();
+        gen_lookup_and_goto_ptr_cached();
     }
 }
 
@@ -6690,7 +6704,7 @@ static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
             pmu_count_insns(ctx);
         }
 
-        tcg_gen_lookup_and_goto_ptr();
+        gen_lookup_and_goto_ptr_cached();
         break;
 
     case DISAS_EXIT_UPDATE:

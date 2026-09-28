@@ -85,6 +85,22 @@ void tcg_gen_goto_tb(unsigned idx);
  */
 void tcg_gen_lookup_and_goto_ptr(void);
 
+/**
+ * tcg_gen_lookup_and_goto_ptr_cached() - tcg_gen_lookup_and_goto_ptr()
+ * with the CPU jump cache probed in generated code.
+ * @pc: guest pc of the next TB, exactly as get_tb_cpu_state() returns it
+ * @flags_ofs: offset from env of the uint32_t that get_tb_cpu_state()
+ *             returns as the TB flags
+ *
+ * For targets whose TB lookup key is (pc, flags) read straight from env,
+ * with a zero cs_base and no CF_PCREL.  On a jump cache hit the generated
+ * code jumps directly to the next TB; on a miss it falls back to
+ * helper_lookup_tb_ptr().  Only user-mode emulation gets the inline probe
+ * (the system-mode hash depends on the target page size); elsewhere this
+ * is the same as tcg_gen_lookup_and_goto_ptr().
+ */
+void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs);
+
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
 

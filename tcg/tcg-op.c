@@ -30,6 +30,11 @@
 #include "exec/plugin-gen.h"
 #include "tcg-internal.h"
 #include "tcg-has.h"
+#ifdef CONFIG_USER_ONLY
+#include "qemu/log.h"
+#include "hw/core/cpu.h"
+#include "accel/tcg/tb-jmp-cache.h"
+#endif
 
 /*
  * Encourage the compiler to tail-call to a function, rather than inlining.
@@ -2639,4 +2644,89 @@ void tcg_gen_lookup_and_goto_ptr(void)
     gen_helper_lookup_tb_ptr(ptr, tcg_env);
     tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
     tcg_temp_free_ptr(ptr);
+}
+
+void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs)
+{
+#ifdef CONFIG_USER_ONLY
+    /*
+     * Same checks as tb_lookup() on its jump cache hit path, done in
+     * generated code: indirect branches (function returns, switch
+     * tables, interpreter dispatch) no longer pay for a helper call.
+     * The CPUState fields are reached from env, which directly follows
+     * CPUState in ArchCPU (see env_cpu()).
+     */
+    const intptr_t cpu_ofs = -(intptr_t)sizeof(CPUState);
+    TCGLabel *miss;
+    TCGv_i64 h, t;
+    TCGv_i32 a, b;
+    TCGv_ptr jc, ent, tb, p;
+
+    QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+
+    if ((tcg_ctx->gen_tb->cflags & (CF_NO_GOTO_PTR | CF_PCREL))
+        || qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+
+    plugin_gen_disable_mem_helpers();
+    miss = gen_new_label();
+    h = tcg_temp_ebb_new_i64();
+    t = tcg_temp_ebb_new_i64();
+    a = tcg_temp_ebb_new_i32();
+    b = tcg_temp_ebb_new_i32();
+    jc = tcg_temp_ebb_new_ptr();
+    ent = tcg_temp_ebb_new_ptr();
+    tb = tcg_temp_ebb_new_ptr();
+    p = tcg_temp_ebb_new_ptr();
+
+    /* entry = &jc->array[(pc ^ (pc >> BITS)) & (SIZE - 1)] */
+    tcg_gen_shri_i64(h, pc, TB_JMP_CACHE_BITS);
+    tcg_gen_xor_i64(h, h, pc);
+    tcg_gen_andi_i64(h, h, TB_JMP_CACHE_SIZE - 1);
+    tcg_gen_shli_i64(h, h, 4);
+    tcg_gen_trunc_i64_ptr(ent, h);
+    tcg_gen_ld_ptr(jc, tcg_env, cpu_ofs + offsetof(CPUState, tb_jmp_cache));
+    tcg_gen_add_ptr(ent, ent, jc);
+
+    /* tb != NULL && entry->pc == pc */
+    tcg_gen_ld_ptr(tb, ent, offsetof(CPUJumpCache, array[0].tb));
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
+    tcg_gen_ld_i64(t, ent, offsetof(CPUJumpCache, array[0].pc));
+    tcg_gen_brcond_i64(TCG_COND_NE, t, pc, miss);
+
+    /* tb->flags == current flags */
+    tcg_gen_ld_i32(a, tb, offsetof(TranslationBlock, flags));
+    tcg_gen_ld_i32(b, tcg_env, flags_ofs);
+    tcg_gen_brcond_i32(TCG_COND_NE, a, b, miss);
+
+    /*
+     * tb->cflags == curr_cflags(): outside of debugging modes (which make
+     * the TB cflags differ from tcg_cflags anyway, hence a miss), the
+     * current cflags are cpu->tcg_cflags.
+     */
+    tcg_gen_ld_i32(a, tb, offsetof(TranslationBlock, cflags));
+    tcg_gen_ld_i32(b, tcg_env, cpu_ofs + offsetof(CPUState, tcg_cflags));
+    tcg_gen_brcond_i32(TCG_COND_NE, a, b, miss);
+
+    /* No breakpoint may be pending (check_for_breakpoints) */
+    tcg_gen_ld_ptr(p, tcg_env, cpu_ofs + offsetof(CPUState, breakpoints));
+    tcg_gen_brcondi_ptr(TCG_COND_NE, p, 0, miss);
+
+    tcg_gen_ld_ptr(p, tb, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(p));
+
+    tcg_temp_free_i64(h);
+    tcg_temp_free_i64(t);
+    tcg_temp_free_i32(a);
+    tcg_temp_free_i32(b);
+    tcg_temp_free_ptr(jc);
+    tcg_temp_free_ptr(ent);
+    tcg_temp_free_ptr(tb);
+    tcg_temp_free_ptr(p);
+
+    gen_set_label(miss);
+#endif
+    tcg_gen_lookup_and_goto_ptr();
 }
