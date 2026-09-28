@@ -3966,6 +3966,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I1(r, r);
     case INDEX_op_anytrue_vec:
         return C_O1_I1(r, x);
+    case INDEX_op_cmpmask_vec:
+        return C_O1_I2(r, x, x);
     case INDEX_op_fpop2_i64:
         return C_O1_I2(r, r, r);
     case INDEX_op_fpop3_i64:

@@ -124,6 +124,7 @@
 #define FPO_KMOVW_KR    (0x92 | P_EXT)
 #define FPO_KMOVD_KR    (0x92 | P_EXT | P_SIMDF2)
 #define FPO_KMOVB_RK    (0x93 | P_EXT | P_DATA16)       /* kmovb r32, k */
+#define FPO_KMOVQ_RK    (0x93 | P_EXT | P_SIMDF2 | P_VEXW)  /* kmovq r64, k */
 #define FPO_MOVQ_XR     (0x6e | P_EXT | P_DATA16 | P_VEXW)  /* vmovq x, r64 */
 #define FPO_MOVQ_RX     (0x7e | P_EXT | P_DATA16 | P_VEXW)  /* vmovq r64, x */
 #define FPO_MOVD_RX     (0x7e | P_EXT | P_DATA16)           /* vmovd r32, x */
@@ -1541,6 +1542,27 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
     case INDEX_op_fpop2_i64:
     case INDEX_op_fpop3_i64:
         tcg_out_fpop_i64(s, opc, vece, args);
+        return true;
+    case INDEX_op_cmpmask_vec:
+        {
+            /* vpcmp[u]{b,w,d,q} k1, a, b, pred; kmovq d, k1 */
+            static const uint8_t pred[16] = {
+                [TCG_COND_EQ] = 0, [TCG_COND_NE] = 4,
+                [TCG_COND_LT] = 1, [TCG_COND_LTU] = 1,
+                [TCG_COND_LE] = 2, [TCG_COND_LEU] = 2,
+                [TCG_COND_GT] = 6, [TCG_COND_GTU] = 6,
+                [TCG_COND_GE] = 5, [TCG_COND_GEU] = 5,
+            };
+            TCGCond c = args[3];
+            bool u = is_unsigned_cond(c);
+            int op = (vece <= MO_16 ? 0x3f : 0x1f) - u;
+
+            op |= P_EXT3A | P_DATA16 | ((vece & 1) ? P_VEXW : 0);
+            op |= type == TCG_TYPE_V256 ? P_VEXL : 0;
+            fpo_rrri(s, op, FPK1, FPX(args[1]), FPX(args[2]), 0, false,
+                     pred[c]);
+            tcg_out_vex_modrm(s, FPO_KMOVQ_RK, args[0], 0, FPK1);
+        }
         return true;
     case INDEX_op_anytrue_vec:
         /* xor d, d; vptest a, a; setnz d */

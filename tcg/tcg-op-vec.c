@@ -884,6 +884,16 @@ void tcg_gen_anytrue_vec(TCGv_i32 r, TCGv_vec a)
               tcgv_vec_arg(a));
 }
 
+void tcg_gen_cmpmask_vec(TCGCond cond, unsigned vece, TCGv_i64 r,
+                         TCGv_vec a, TCGv_vec b)
+{
+    TCGType type = tcgv_vec_temp(a)->base_type;
+
+    tcg_debug_assert(tcg_op_supported(INDEX_op_cmpmask_vec, type, 0));
+    vec_gen_4(INDEX_op_cmpmask_vec, type, vece, tcgv_i64_arg(r),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), cond);
+}
+
 void tcg_gen_fpop1_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, unsigned fpop)
 {
     tcg_debug_assert(tcg_can_emit_fpop(fpop, TCG_TYPE_V64, vece));

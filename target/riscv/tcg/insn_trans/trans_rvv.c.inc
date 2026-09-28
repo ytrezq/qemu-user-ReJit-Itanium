@@ -2362,12 +2362,158 @@ static bool opivv_cmp_check(DisasContext *s, arg_rmrr *a)
            vext_check_mss(s, a->rd, a->rs1, a->rs2);
 }
 
-GEN_OPIVV_TRANS(vmseq_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmsne_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmsltu_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmslt_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmsleu_vv, opivv_cmp_check)
-GEN_OPIVV_TRANS(vmsle_vv, opivv_cmp_check)
+#ifdef CONFIG_USER_ONLY
+/*
+ * Mask results in host code (user mode, VLEN 128 or 256, vstart 0, mask
+ * tail undisturbed): mask_merge() writes word @w (bits 64 * w...) of the
+ * mask register @vd from @res, only its bits below vl and, for vm = 0,
+ * set in v0 (mask undisturbed).
+ */
+static bool mask_ok(DisasContext *s, bool vm)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+
+    return (vlenb == 16 || vlenb == 32) && s->vstart_eq_zero
+           && !s->cfg_vta_all_1s && (vm || !s->vma);
+}
+
+/* the bits of word @w below vl */
+static TCGv_i64 mask_vl_bits(DisasContext *s, int w)
+{
+    TCGv_i64 m;
+    TCGv_i32 c, h;
+
+    if (s->vl_const >= 0) {
+        int64_t n = MIN(MAX((int64_t)s->vl_const - 64 * w, 0), 64);
+        return tcg_constant_i64(n == 64 ? -1 : n ? MAKE_64BIT_MASK(0, n) : 0);
+    }
+    /* n = min(max(vl - 64 w, 0), 64); (1 << n / 2 << (n - n / 2)) - 1 */
+    c = tcg_temp_new_i32();
+    h = tcg_temp_new_i32();
+    m = tcg_temp_new_i64();
+    tcg_gen_umin_i32(c, cpu_vl, tcg_constant_i32(64 * (w + 1)));
+    tcg_gen_umax_i32(c, c, tcg_constant_i32(64 * w));
+    tcg_gen_subi_i32(c, c, 64 * w);
+    tcg_gen_shri_i32(h, c, 1);
+    tcg_gen_sub_i32(c, c, h);
+    tcg_gen_extu_i32_i64(m, h);
+    tcg_gen_shl_i64(m, tcg_constant_i64(1), m);
+    {
+        TCGv_i64 c64 = tcg_temp_new_i64();
+
+        tcg_gen_extu_i32_i64(c64, c);
+        tcg_gen_shl_i64(m, m, c64);
+    }
+    tcg_gen_subi_i64(m, m, 1);
+    return m;
+}
+
+static void mask_merge(DisasContext *s, int vd, int w, TCGv_i64 res, bool vm)
+{
+    TCGv_i64 m = mask_vl_bits(s, w);
+    TCGv_i64 old = tcg_temp_new_i64();
+    uint32_t ofs = vreg_ofs(s, vd) + w * 8;
+
+    if (!vm) {
+        TCGv_i64 m0 = tcg_temp_new_i64();
+
+        tcg_gen_ld_i64(m0, tcg_env, vreg_ofs(s, 0) + w * 8);
+        tcg_gen_and_i64(m0, m0, m);
+        m = m0;
+    }
+    tcg_gen_ld_i64(old, tcg_env, ofs);
+    tcg_gen_and_i64(res, res, m);
+    tcg_gen_andc_i64(old, old, m);
+    tcg_gen_or_i64(res, res, old);
+    tcg_gen_st_i64(res, tcg_env, ofs);
+}
+
+/*
+ * vms<cond>.vv/vx/vi: one host compare into an opmask per register of
+ * the source group (cmpmask_vec), the bits gathered into the words of
+ * the mask, which are then merged into vd.  All the sources are read
+ * before vd, which may be one of them, or v0, is written.
+ */
+static bool cmp_inline(DisasContext *s, arg_rmrr *a, TCGCond cond,
+                       int src_kind, TCGv_i64 x)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+    TCGType type = vlenb == 32 ? TCG_TYPE_V256 : TCG_TYPE_V128;
+    uint32_t n = vlenb >> s->sew;
+    int nregs = s->lmul > 0 ? 1 << s->lmul : 1;
+    uint32_t vlmax = s->lmul < 0 ? n >> -s->lmul : n << s->lmul;
+    int nwords = DIV_ROUND_UP(vlmax, 64);
+    TCGv_i64 words[4] = { };
+    TCGv_vec y = NULL;
+
+    if (!mask_ok(s, a->vm) || !tcg_op_supported(INDEX_op_cmpmask_vec,
+                                                  type, 0)) {
+        return false;
+    }
+    if (src_kind) {
+        y = tcg_temp_new_vec(type);
+        tcg_gen_dup_i64_vec(s->sew, y, x);
+    }
+    for (int r = 0; r < nregs; r++) {
+        TCGv_vec v2 = tcg_temp_new_vec(type);
+        TCGv_i64 bits = tcg_temp_new_i64();
+        int w = r * n / 64;
+
+        tcg_gen_ld_vec(v2, tcg_env, vreg_ofs(s, a->rs2 + r));
+        if (!src_kind) {
+            y = tcg_temp_new_vec(type);
+            tcg_gen_ld_vec(y, tcg_env, vreg_ofs(s, a->rs1 + r));
+        }
+        tcg_gen_cmpmask_vec(cond, s->sew, bits, v2, y);
+        if (n < 64) {
+            tcg_gen_andi_i64(bits, bits, MAKE_64BIT_MASK(0, n));
+            if (r * n % 64) {
+                tcg_gen_shli_i64(bits, bits, r * n % 64);
+            }
+        }
+        if (words[w]) {
+            tcg_gen_or_i64(words[w], words[w], bits);
+        } else {
+            words[w] = bits;
+        }
+    }
+    for (int w = 0; w < nwords; w++) {
+        mask_merge(s, a->rd, w, words[w], a->vm);
+    }
+    mark_vs_dirty(s);
+    finalize_rvv_inst(s);
+    return true;
+}
+#else
+static bool cmp_inline(DisasContext *s, arg_rmrr *a, TCGCond cond,
+                       int src_kind, TCGv_i64 x)
+{
+    return false;
+}
+#endif
+
+#define GEN_OPIVV_CMP_TRANS(NAME, COND)                                  \
+static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
+{                                                                        \
+    if (opivv_cmp_check(s, a)) {                                         \
+        static gen_helper_gvec_4_ptr * const fns[4] = {                  \
+            gen_helper_##NAME##_b, gen_helper_##NAME##_h,                \
+            gen_helper_##NAME##_w, gen_helper_##NAME##_d,                \
+        };                                                               \
+        if (cmp_inline(s, a, COND, 0, NULL)) {                           \
+            return true;                                                 \
+        }                                                                \
+        return opivv_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s);\
+    }                                                                    \
+    return false;                                                        \
+}
+
+GEN_OPIVV_CMP_TRANS(vmseq_vv, TCG_COND_EQ)
+GEN_OPIVV_CMP_TRANS(vmsne_vv, TCG_COND_NE)
+GEN_OPIVV_CMP_TRANS(vmsltu_vv, TCG_COND_LTU)
+GEN_OPIVV_CMP_TRANS(vmslt_vv, TCG_COND_LT)
+GEN_OPIVV_CMP_TRANS(vmsleu_vv, TCG_COND_LEU)
+GEN_OPIVV_CMP_TRANS(vmsle_vv, TCG_COND_LE)
 
 static bool opivx_cmp_check(DisasContext *s, arg_rmrr *a)
 {
@@ -2376,21 +2522,58 @@ static bool opivx_cmp_check(DisasContext *s, arg_rmrr *a)
            vext_check_ms(s, a->rd, a->rs2);
 }
 
-GEN_OPIVX_TRANS(vmseq_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsne_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsltu_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmslt_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsleu_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsle_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsgtu_vx, opivx_cmp_check)
-GEN_OPIVX_TRANS(vmsgt_vx, opivx_cmp_check)
+#define GEN_OPIVX_CMP_TRANS(NAME, COND)                                  \
+static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
+{                                                                        \
+    if (opivx_cmp_check(s, a)) {                                         \
+        static gen_helper_opivx * const fns[4] = {                       \
+            gen_helper_##NAME##_b, gen_helper_##NAME##_h,                \
+            gen_helper_##NAME##_w, gen_helper_##NAME##_d,                \
+        };                                                               \
+        TCGv_i64 x = tcg_temp_new_i64();                                 \
+                                                                         \
+        tcg_gen_ext_tl_i64(x, get_gpr(s, a->rs1, EXT_SIGN));             \
+        if (cmp_inline(s, a, COND, 1, x)) {                              \
+            return true;                                                 \
+        }                                                                \
+        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s);\
+    }                                                                    \
+    return false;                                                        \
+}
 
-GEN_OPIVI_TRANS(vmseq_vi, IMM_SX, vmseq_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsne_vi, IMM_SX, vmsne_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsleu_vi, IMM_SX, vmsleu_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsle_vi, IMM_SX, vmsle_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsgtu_vi, IMM_SX, vmsgtu_vx, opivx_cmp_check)
-GEN_OPIVI_TRANS(vmsgt_vi, IMM_SX, vmsgt_vx, opivx_cmp_check)
+GEN_OPIVX_CMP_TRANS(vmseq_vx, TCG_COND_EQ)
+GEN_OPIVX_CMP_TRANS(vmsne_vx, TCG_COND_NE)
+GEN_OPIVX_CMP_TRANS(vmsltu_vx, TCG_COND_LTU)
+GEN_OPIVX_CMP_TRANS(vmslt_vx, TCG_COND_LT)
+GEN_OPIVX_CMP_TRANS(vmsleu_vx, TCG_COND_LEU)
+GEN_OPIVX_CMP_TRANS(vmsle_vx, TCG_COND_LE)
+GEN_OPIVX_CMP_TRANS(vmsgtu_vx, TCG_COND_GTU)
+GEN_OPIVX_CMP_TRANS(vmsgt_vx, TCG_COND_GT)
+
+#define GEN_OPIVI_CMP_TRANS(NAME, OPIVX, COND)                           \
+static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
+{                                                                        \
+    if (opivx_cmp_check(s, a)) {                                         \
+        static gen_helper_opivx * const fns[4] = {                       \
+            gen_helper_##OPIVX##_b, gen_helper_##OPIVX##_h,              \
+            gen_helper_##OPIVX##_w, gen_helper_##OPIVX##_d,              \
+        };                                                               \
+        if (cmp_inline(s, a, COND, 1,                                    \
+                       tcg_constant_i64(extract_imm(s, a->rs1, IMM_SX)))) { \
+            return true;                                                 \
+        }                                                                \
+        return opivi_trans(a->rd, a->rs1, a->rs2, a->vm,                 \
+                           fns[s->sew], s, IMM_SX);                      \
+    }                                                                    \
+    return false;                                                        \
+}
+
+GEN_OPIVI_CMP_TRANS(vmseq_vi, vmseq_vx, TCG_COND_EQ)
+GEN_OPIVI_CMP_TRANS(vmsne_vi, vmsne_vx, TCG_COND_NE)
+GEN_OPIVI_CMP_TRANS(vmsleu_vi, vmsleu_vx, TCG_COND_LEU)
+GEN_OPIVI_CMP_TRANS(vmsle_vi, vmsle_vx, TCG_COND_LE)
+GEN_OPIVI_CMP_TRANS(vmsgtu_vi, vmsgtu_vx, TCG_COND_GTU)
+GEN_OPIVI_CMP_TRANS(vmsgt_vi, vmsgt_vx, TCG_COND_GT)
 
 /* Vector Integer Min/Max Instructions */
 GEN_OPIVV_GVEC_TRANS(vminu_vv, umin)
@@ -3977,7 +4160,70 @@ GEN_OPFVV_WIDEN_TRANS(vfwredosum_vs, freduction_widen_check)
  */
 
 /* Vector Mask-Register Logical Instructions */
-#define GEN_MM_TRANS(NAME)                                         \
+#ifdef CONFIG_USER_ONLY
+/*
+ * vm<op>.mm: word by word, vd = op(vs2, vs1) for the bits below vl (the
+ * words up to VLMAX of the current vtype: vl is at most that).
+ */
+static bool mm_inline(DisasContext *s, arg_r *a,
+                      void (*op)(TCGv_i64, TCGv_i64, TCGv_i64))
+{
+    uint32_t n = s->cfg_ptr->vlenb >> s->sew;
+    uint32_t vlmax = s->lmul < 0 ? n >> -s->lmul : n << s->lmul;
+    int nwords = DIV_ROUND_UP(vlmax, 64);
+    TCGv_i64 res[4];
+
+    if (!mask_ok(s, true)) {
+        return false;
+    }
+    /* all the sources first: vd may be one of them */
+    for (int w = 0; w < nwords; w++) {
+        TCGv_i64 x = tcg_temp_new_i64();
+        TCGv_i64 y = tcg_temp_new_i64();
+
+        tcg_gen_ld_i64(x, tcg_env, vreg_ofs(s, a->rs2) + w * 8);
+        tcg_gen_ld_i64(y, tcg_env, vreg_ofs(s, a->rs1) + w * 8);
+        op(x, x, y);
+        res[w] = x;
+    }
+    for (int w = 0; w < nwords; w++) {
+        mask_merge(s, a->rd, w, res[w], true);
+    }
+    mark_vs_dirty(s);
+    return true;
+}
+
+/* the words of mask register @vs2 below vl, and with v0 for vm = 0 */
+static int mask_src_words(DisasContext *s, int vs2, bool vm, TCGv_i64 *out)
+{
+    uint32_t n = s->cfg_ptr->vlenb >> s->sew;
+    uint32_t vlmax = s->lmul < 0 ? n >> -s->lmul : n << s->lmul;
+    int nwords = DIV_ROUND_UP(vlmax, 64);
+
+    for (int w = 0; w < nwords; w++) {
+        TCGv_i64 x = tcg_temp_new_i64();
+
+        tcg_gen_ld_i64(x, tcg_env, vreg_ofs(s, vs2) + w * 8);
+        tcg_gen_and_i64(x, x, mask_vl_bits(s, w));
+        if (!vm) {
+            TCGv_i64 m0 = tcg_temp_new_i64();
+
+            tcg_gen_ld_i64(m0, tcg_env, vreg_ofs(s, 0) + w * 8);
+            tcg_gen_and_i64(x, x, m0);
+        }
+        out[w] = x;
+    }
+    return nwords;
+}
+#else
+static bool mm_inline(DisasContext *s, arg_r *a,
+                      void (*op)(TCGv_i64, TCGv_i64, TCGv_i64))
+{
+    return false;
+}
+#endif
+
+#define GEN_MM_TRANS(NAME, OP)                                     \
 static bool trans_##NAME(DisasContext *s, arg_r *a)                \
 {                                                                  \
     if (require_rvv(s) &&                                          \
@@ -3985,6 +4231,10 @@ static bool trans_##NAME(DisasContext *s, arg_r *a)                \
         uint32_t data = 0;                                         \
         gen_helper_gvec_4_ptr *fn = gen_helper_##NAME;             \
                                                                    \
+        if (mm_inline(s, a, OP)) {                                 \
+            finalize_rvv_inst(s);                                  \
+            return true;                                           \
+        }                                                          \
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);             \
         data =                                                     \
             FIELD_DP32(data, VDATA, VTA_ALL_1S, s->cfg_vta_all_1s);\
@@ -3999,14 +4249,15 @@ static bool trans_##NAME(DisasContext *s, arg_r *a)                \
     return false;                                                  \
 }
 
-GEN_MM_TRANS(vmand_mm)
-GEN_MM_TRANS(vmnand_mm)
-GEN_MM_TRANS(vmandn_mm)
-GEN_MM_TRANS(vmxor_mm)
-GEN_MM_TRANS(vmor_mm)
-GEN_MM_TRANS(vmnor_mm)
-GEN_MM_TRANS(vmorn_mm)
-GEN_MM_TRANS(vmxnor_mm)
+/* vmandn: vs2 & ~vs1, vmorn: vs2 | ~vs1 */
+GEN_MM_TRANS(vmand_mm, tcg_gen_and_i64)
+GEN_MM_TRANS(vmnand_mm, tcg_gen_nand_i64)
+GEN_MM_TRANS(vmandn_mm, tcg_gen_andc_i64)
+GEN_MM_TRANS(vmxor_mm, tcg_gen_xor_i64)
+GEN_MM_TRANS(vmor_mm, tcg_gen_or_i64)
+GEN_MM_TRANS(vmnor_mm, tcg_gen_nor_i64)
+GEN_MM_TRANS(vmorn_mm, tcg_gen_orc_i64)
+GEN_MM_TRANS(vmxnor_mm, tcg_gen_eqv_i64)
 
 /* Vector count population in mask vcpop */
 static bool trans_vcpop_m(DisasContext *s, arg_rmr *a)
@@ -4024,6 +4275,21 @@ static bool trans_vcpop_m(DisasContext *s, arg_rmr *a)
         mask = tcg_temp_new_ptr();
         src2 = tcg_temp_new_ptr();
         dst = dest_gpr(s, a->rd);
+#ifdef CONFIG_USER_ONLY
+        if (mask_ok(s, true) && get_xl(s) == MXL_RV64) {
+            TCGv_i64 w[4];
+            int nw = mask_src_words(s, a->rs2, a->vm, w);
+
+            /* the sum of the populations of the words */
+            tcg_gen_ctpop_i64(dst, w[0]);
+            for (int i = 1; i < nw; i++) {
+                tcg_gen_ctpop_i64(w[i], w[i]);
+                tcg_gen_add_i64(dst, dst, w[i]);
+            }
+            gen_set_gpr(s, a->rd, dst);
+            return true;
+        }
+#endif
         desc = tcg_constant_i32(simd_desc(s->cfg_ptr->vlenb,
                                           s->cfg_ptr->vlenb, data));
 
@@ -4053,6 +4319,25 @@ static bool trans_vfirst_m(DisasContext *s, arg_rmr *a)
         mask = tcg_temp_new_ptr();
         src2 = tcg_temp_new_ptr();
         dst = dest_gpr(s, a->rd);
+#ifdef CONFIG_USER_ONLY
+        if (mask_ok(s, true) && get_xl(s) == MXL_RV64) {
+            TCGv_i64 w[4];
+            int nw = mask_src_words(s, a->rs2, a->vm, w);
+
+            /* the first word with a bit set, from the last one */
+            tcg_gen_movi_i64(dst, -1);
+            for (int i = nw - 1; i >= 0; i--) {
+                TCGv_i64 t = tcg_temp_new_i64();
+
+                tcg_gen_ctzi_i64(t, w[i], 0);
+                tcg_gen_addi_i64(t, t, 64 * i);
+                tcg_gen_movcond_i64(TCG_COND_NE, dst, w[i],
+                                    tcg_constant_i64(0), t, dst);
+            }
+            gen_set_gpr(s, a->rd, dst);
+            return true;
+        }
+#endif
         desc = tcg_constant_i32(simd_desc(s->cfg_ptr->vlenb,
                                           s->cfg_ptr->vlenb, data));
 
