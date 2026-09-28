@@ -48,6 +48,10 @@
 #ifndef TCG_TARGET_HAS_fpop_vec
 #define TCG_TARGET_HAS_fpop_vec         0
 #endif
+#ifndef TCG_TARGET_HAS_qemu_ldst_nocall
+/* tcg_target_qemu_ldst_calls() tells which guest accesses call a helper */
+#define TCG_TARGET_HAS_qemu_ldst_nocall 0
+#endif
 #ifndef TCG_TARGET_HAS_crypto_vec
 #define TCG_TARGET_HAS_crypto_vec 0
 #endif

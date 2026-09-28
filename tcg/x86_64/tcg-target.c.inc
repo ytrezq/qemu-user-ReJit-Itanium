@@ -1932,6 +1932,36 @@ static inline int setup_guest_base_seg(void)
  * In both cases, return a TCGLabelQemuLdst structure if the slow path
  * is required and fill in @h with the host address for the fast path.
  */
+/*
+ * A load or store of up to 8 bytes is done by x86 as one access within
+ * a cache line, which is atomic, or as two accesses split at a cache
+ * line boundary, which no naturally aligned sub-object straddles:
+ * MO_ATOM_SUBALIGN holds whatever the address (e.g. Arm LDRD/STRD and
+ * VLDR/VSTR of a double at a 4-aligned address, which otherwise took
+ * the slow path).
+ */
+static TCGAtomAlign x86_atom_and_align(TCGContext *s, MemOp opc)
+{
+    MemOp s_bits = opc & MO_SIZE;
+
+    return atom_and_align_for_opc(s, opc,
+                                  (opc & MO_ATOM_MASK) == MO_ATOM_SUBALIGN
+                                  && s_bits <= MO_64
+                                  ? MO_ATOM_SUBALIGN : MO_ATOM_WITHIN16,
+                                  s_bits == MO_128);
+}
+
+/*
+ * In user mode, only an access that needs an alignment test has a slow
+ * path, i.e. calls a helper: the others clobber no call-clobbered
+ * register, so that values live across them may stay in any register.
+ */
+static bool tcg_target_qemu_ldst_calls(TCGContext *s, MemOpIdx oi)
+{
+    return tcg_use_softmmu
+           || x86_atom_and_align(s, get_memop(oi)).align != 0;
+}
+
 static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
                                            TCGReg addr, MemOpIdx oi, bool is_ld)
 {
@@ -1948,19 +1978,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         *h = x86_guest_base;
     }
     h->base = addr;
-    /*
-     * A load or store of up to 8 bytes is done by x86 as one access within
-     * a cache line, which is atomic, or as two accesses split at a cache
-     * line boundary, which no naturally aligned sub-object straddles:
-     * MO_ATOM_SUBALIGN holds whatever the address (e.g. Arm LDRD/STRD and
-     * VLDR/VSTR of a double at a 4-aligned address, which otherwise took
-     * the slow path).
-     */
-    h->aa = atom_and_align_for_opc(s, opc,
-                                   (opc & MO_ATOM_MASK) == MO_ATOM_SUBALIGN
-                                   && s_bits <= MO_64
-                                   ? MO_ATOM_SUBALIGN : MO_ATOM_WITHIN16,
-                                   s_bits == MO_128);
+    h->aa = x86_atom_and_align(s, opc);
     a_mask = (1 << h->aa.align) - 1;
 
     if (tcg_use_softmmu) {

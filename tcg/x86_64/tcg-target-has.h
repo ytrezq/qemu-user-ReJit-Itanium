@@ -67,6 +67,7 @@
 #define TCG_TARGET_HAS_perm2b_vec       have_avx512vbmi
 /* SHA-NI, with EVEX moves to xmm16-31 to free the fixed registers it needs */
 #define TCG_TARGET_HAS_crypto_vec       ((cpuinfo & CPUINFO_SHA) && have_avx512vl)
+#define TCG_TARGET_HAS_qemu_ldst_nocall 1
 #define TCG_TARGET_HAS_ldstm_vec        have_avx512bw
 
 #define TCG_TARGET_deposit_valid(type, ofs, len) \

@@ -1107,6 +1107,27 @@ typedef struct TCGOutOpSubtract {
 
 #include "tcg-target.c.inc"
 
+/*
+ * Whether an op with TCG_OPF_CALL_CLOBBER does call a function: the guest
+ * loads and stores only do in their slow path, which may not exist.
+ */
+static bool tcg_op_calls(TCGContext *s, const TCGOp *op, const TCGOpDef *def)
+{
+#if TCG_TARGET_HAS_qemu_ldst_nocall
+    switch (op->opc) {
+    case INDEX_op_qemu_ld:
+    case INDEX_op_qemu_st:
+    case INDEX_op_qemu_ld2:
+    case INDEX_op_qemu_st2:
+        return tcg_target_qemu_ldst_calls(s, op->args[def->nb_oargs
+                                                      + def->nb_iargs]);
+    default:
+        break;
+    }
+#endif
+    return true;
+}
+
 #ifndef CONFIG_TCG_INTERPRETER
 /* Validate CPUTLBDescFast placement. */
 QEMU_BUILD_BUG_ON((int)(offsetof(CPUNegativeOffsetState, tlb.f[0]) -
@@ -4249,7 +4270,8 @@ liveness_pass_1(TCGContext *s)
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 assert_carry_dead(s);
                 la_global_sync(s, nb_globals);
-                if (def->flags & TCG_OPF_CALL_CLOBBER) {
+                if ((def->flags & TCG_OPF_CALL_CLOBBER)
+                    && tcg_op_calls(s, op, def)) {
                     la_cross_call(s, nb_temps);
                 }
             }
@@ -5456,7 +5478,7 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     } else if (def->flags & TCG_OPF_BB_END) {
         tcg_reg_alloc_bb_end(s, i_allocated_regs);
     } else {
-        if (def->flags & TCG_OPF_CALL_CLOBBER) {
+        if ((def->flags & TCG_OPF_CALL_CLOBBER) && tcg_op_calls(s, op, def)) {
             assert_carry_dead(s);
             /* XXX: permit generic clobber register list ? */
             for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
