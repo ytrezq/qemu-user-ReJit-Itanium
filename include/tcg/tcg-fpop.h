@@ -120,7 +120,8 @@ typedef enum TCGFPOp {
 /* fpcmpcc_vec: Arm NZCV in bits 31..28 instead of TCG_FPCC_* */
 #define TCG_FPOP_F_CC_NZCV      (1u << 28)
 /*
- * RISC-V rules, scalar (TCG_TYPE_V64) only:
+ * RISC-V rules (for vectors, only ADD, SUB, MUL, DIV, SQRT, FMA, MAXNUM
+ * and MINNUM):
  *  - every NaN result is the default NaN (0x7ff8000000000000 /
  *    0x7fc00000), and 0 * inf + a quiet NaN signals invalid (FMA);
  *  - tininess is detected after rounding, as on x86;

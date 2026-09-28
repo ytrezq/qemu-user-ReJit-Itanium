@@ -411,19 +411,33 @@ static void fpo_fma_imz(TCGContext *s, const int *in, bool scalar, bool dbl,
 /*
  * TCG_FPOP_F_RISCV: a NaN result is the default NaN, and for FMA
  * (@fma_in = a, b, c) 0 * inf + a quiet NaN signals invalid as well.
- * Scalars only; the other lanes get the default NaN too.
+ * For scalars the other lanes get the default NaN too.
  */
-static void fpo_nan_canon(TCGContext *s, int d, bool dbl, const int *fma_in)
+static void fpo_nan_canon(TCGContext *s, int d, bool scalar, bool dbl,
+                          const int *fma_in)
 {
+    uint64_t dnan = dbl ? 0x7ff8000000000000ull : 0x7fc00000u;
     uint8_t *done;
 
-    /* common case: not a NaN */
-    fpo_rrr(s, dbl ? FPO_UCOMISD : FPO_UCOMISS, d, 0, d, 0, false);
-    done = fpo_jcc32(s, JCC_JNP);
-    if (fma_in) {
-        fpo_fma_imz(s, fma_in, true, dbl, 0);
+    if (scalar) {
+        /* common case: not a NaN */
+        fpo_rrr(s, dbl ? FPO_UCOMISD : FPO_UCOMISS, d, 0, d, 0, false);
+        done = fpo_jcc32(s, JCC_JNP);
+        if (fma_in) {
+            fpo_fma_imz(s, fma_in, true, dbl, 0);
+        }
+        fpo_ldc(s, d, dbl, dnan);
+    } else {
+        /* k1 = the NaN lanes */
+        fpo_rrri(s, FPO_CMP | fpo_pfx(false, dbl), FPK1, d, d, 0, false,
+                 FPO_PRED_UNORD_Q);
+        tcg_out_vex_modrm(s, FPO_KORTESTB, FPK1, 0, FPK1);
+        done = fpo_jcc32(s, JCC_JE);
+        if (fma_in) {
+            fpo_fma_imz(s, fma_in, false, dbl, FPK1);
+        }
+        fpo_ldc_k(s, d, dbl, dnan, FPK1);
     }
-    fpo_ldc(s, d, dbl, dbl ? 0x7ff8000000000000ull : 0x7fc00000u);
     fpo_patch32(s, done);
 }
 
@@ -707,15 +721,14 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
              * a NaN loses against the other operand, and two NaNs give
              * the default NaN.
              */
-            int range = (FPO_RANGEP + 1) | (dbl ? P_VEXW : 0);
+            int range = (FPO_RANGEP + (scalar ? 1 : 0)) | (dbl ? P_VEXW : 0);
             int blend = dbl ? FPO_PBLENDMQ : FPO_PBLENDMD;
             bool max = TCG_FPOP_OP(fpop) == TCG_FPOP_MAXNUM;
             uint8_t *done;
 
-            tcg_debug_assert(scalar);
             fpo_rrri(s, range, d, a, b, 0, false, max ? 0x05 : 0x04);
-            fpo_class(s, FPK1, a, true, dbl, FPO_CLS_NAN);
-            fpo_class(s, FPK2, b, true, dbl, FPO_CLS_NAN);
+            fpo_class(s, FPK1, a, scalar, dbl, FPO_CLS_NAN);
+            fpo_class(s, FPK2, b, scalar, dbl, FPO_CLS_NAN);
             tcg_out_vex_modrm(s, FPO_KORTESTB, FPK1, 0, FPK2);
             done = fpo_jcc32(s, JCC_JE);
             fpo_rrr(s, blend, d, d, b, FPK1, false);
@@ -816,7 +829,7 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
     fpo_rrr(s, opc, d, a, b, 0, false);
     if (fpop & TCG_FPOP_F_RISCV) {
         /* tininess after rounding: nothing else to do */
-        fpo_nan_canon(s, d, dbl, NULL);
+        fpo_nan_canon(s, d, scalar, dbl, NULL);
         return;
     }
     if (fpop & TCG_FPOP_F_SNAN_FIRST) {
@@ -866,7 +879,7 @@ static void tcg_out_fpop3(TCGContext *s, TCGType type, unsigned vece,
     }
 
     if (fpop & TCG_FPOP_F_RISCV) {
-        fpo_nan_canon(s, d, dbl, in);
+        fpo_nan_canon(s, d, scalar, dbl, in);
         return;
     }
     if (fpop & TCG_FPOP_F_NEG_RES) {
@@ -977,7 +990,7 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
     case TCG_FPOP_SQRT:
         fpo_rrr(s, FPO_SQRT | pfx, d, scalar ? a : 0, a, 0, false);
         if (riscv) {
-            fpo_nan_canon(s, d, dbl, NULL);
+            fpo_nan_canon(s, d, scalar, dbl, NULL);
             return;
         }
         if (fpop & TCG_FPOP_F_SNAN_FIRST) {
@@ -1126,7 +1139,7 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
         tcg_debug_assert(scalar && !dbl);
         fpo_rrr(s, FPO_CVTSS2SD, d, a, a, 0, false);
         if (riscv) {
-            fpo_nan_canon(s, d, true, NULL);
+            fpo_nan_canon(s, d, true, true, NULL);
         }
         return;
 
@@ -1134,7 +1147,7 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
         tcg_debug_assert(scalar && dbl);
         fpo_rrr(s, FPO_CVTSD2SS, d, a, a, 0, false);
         if (riscv) {
-            fpo_nan_canon(s, d, false, NULL);
+            fpo_nan_canon(s, d, true, false, NULL);
         } else {
             fpo_tiny_cvt(s, d, a);
         }
@@ -1224,7 +1237,23 @@ static bool tcg_target_can_emit_fpop(unsigned fpop, TCGType type,
         return false;
     }
     if (fpop & TCG_FPOP_F_RISCV) {
-        if (!scalar || (fpop & (TCG_FPOP_F_DEFNAN | TCG_FPOP_F_SP |
+        if (!scalar) {
+            /* vectors (RVV): the arithmetic only */
+            switch (TCG_FPOP_OP(fpop)) {
+            case TCG_FPOP_ADD:
+            case TCG_FPOP_SUB:
+            case TCG_FPOP_MUL:
+            case TCG_FPOP_DIV:
+            case TCG_FPOP_SQRT:
+            case TCG_FPOP_FMA:
+            case TCG_FPOP_MAXNUM:
+            case TCG_FPOP_MINNUM:
+                break;
+            default:
+                return false;
+            }
+        }
+        if ((fpop & (TCG_FPOP_F_DEFNAN | TCG_FPOP_F_SP |
                                 TCG_FPOP_F_NAN_ACB | TCG_FPOP_F_NEG_RES |
                                 TCG_FPOP_F_PPC_SAT | TCG_FPOP_F_DUP32 |
                                 TCG_FPOP_F_SNAN_FIRST |

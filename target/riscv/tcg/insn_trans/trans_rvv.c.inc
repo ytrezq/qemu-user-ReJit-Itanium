@@ -3209,12 +3209,144 @@ static bool opfvv_check(DisasContext *s, arg_rmrr *a, int8_t valid_bfa_vsew)
            vext_check_altfmt(s, valid_bfa_vsew);
 }
 
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
+/*
+ * RVV floating point in host code (see TCG_FPOP_F_RISCV and the scalar
+ * instructions in trans_rvf.c.inc) over whole register groups: SEW 32 or
+ * 64, vl == VLMAX, LMUL >= 1, unmasked (no lane is inactive, so none can
+ * raise spurious exceptions), frm RNE (all these round per frm), in
+ * 128-bit pieces.
+ */
+typedef enum {
+    FPV_VV,         /* vd = op(vs2, vs1 or f) */
+    FPV_RV,         /* vd = op(f, vs2) */
+    FPV_V,          /* vd = op(vs2) */
+    FPV_ACC,        /* vd = fma(vs1 or f, vs2, vd) */
+    FPV_MADD,       /* vd = fma(vs1 or f, vd, vs2) */
+} FpvForm;
+
+static const struct {
+    const char *name;
+    unsigned fpop;
+    FpvForm form;
+} fpv_ops[] = {
+    { "vfadd", TCG_FPOP_ADD, FPV_VV },
+    { "vfsub", TCG_FPOP_SUB, FPV_VV },
+    { "vfrsub", TCG_FPOP_SUB, FPV_RV },
+    { "vfmul", TCG_FPOP_MUL, FPV_VV },
+    { "vfdiv", TCG_FPOP_DIV, FPV_VV },
+    { "vfrdiv", TCG_FPOP_DIV, FPV_RV },
+    { "vfmin", TCG_FPOP_MINNUM, FPV_VV },
+    { "vfmax", TCG_FPOP_MAXNUM, FPV_VV },
+    { "vfsqrt", TCG_FPOP_SQRT, FPV_V },
+    { "vfmacc", TCG_FPOP_FMA, FPV_ACC },
+    { "vfnmacc", TCG_FPOP_FMA | TCG_FPOP_F_NEG_PROD | TCG_FPOP_F_NEG_ADD,
+      FPV_ACC },
+    { "vfmsac", TCG_FPOP_FMA | TCG_FPOP_F_NEG_ADD, FPV_ACC },
+    { "vfnmsac", TCG_FPOP_FMA | TCG_FPOP_F_NEG_PROD, FPV_ACC },
+    { "vfmadd", TCG_FPOP_FMA, FPV_MADD },
+    { "vfnmadd", TCG_FPOP_FMA | TCG_FPOP_F_NEG_PROD | TCG_FPOP_F_NEG_ADD,
+      FPV_MADD },
+    { "vfmsub", TCG_FPOP_FMA | TCG_FPOP_F_NEG_ADD, FPV_MADD },
+    { "vfnmsub", TCG_FPOP_FMA | TCG_FPOP_F_NEG_PROD, FPV_MADD },
+};
+
+/* @name: the instruction, "vfadd_vf"...; @src1 is vs1, or rs1 for _vf */
+static bool fpv_inline(DisasContext *s, const char *name, int vd, int src1,
+                       int vs2, bool vm)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+    const char *us = strrchr(name, '_');
+    bool vf = us && !strcmp(us, "_vf");
+    unsigned fpop = 0;
+    FpvForm form = FPV_VV;
+    TCGv_vec f = NULL;
+    size_t i;
+
+    if (!s->fpj || s->fpj_frm != RISCV_FRM_RNE || s->altfmt
+        || (s->sew != MO_32 && s->sew != MO_64) || !s->vl_eq_vlmax
+        || s->lmul < 0 || !vm || (vlenb != 16 && vlenb != 32) || !us) {
+        return false;
+    }
+    for (i = 0; i < ARRAY_SIZE(fpv_ops); i++) {
+        if (strlen(fpv_ops[i].name) == us - name
+            && !strncmp(fpv_ops[i].name, name, us - name)) {
+            fpop = fpv_ops[i].fpop | TCG_FPOP_F_RISCV;
+            form = fpv_ops[i].form;
+            break;
+        }
+    }
+    if (i == ARRAY_SIZE(fpv_ops)
+        || !tcg_can_emit_fpop(fpop, TCG_TYPE_V128, s->sew)) {
+        return false;
+    }
+
+    if (vf) {
+        TCGv_i64 t = tcg_temp_new_i64();
+
+        do_nanbox(s, t, cpu_fpr[src1]);
+        f = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_dup_i64_vec(s->sew, f, t);
+    }
+    for (int r = 0; r < (1 << s->lmul); r++) {
+        for (uint32_t h = 0; h < vlenb; h += 16) {
+            TCGv_vec x2 = tcg_temp_new_vec(TCG_TYPE_V128);
+            TCGv_vec x1 = f;
+            TCGv_vec res = tcg_temp_new_vec(TCG_TYPE_V128);
+
+            tcg_gen_ld_vec(x2, tcg_env, vreg_ofs(s, vs2 + r) + h);
+            if (form != FPV_V && !x1) {
+                x1 = tcg_temp_new_vec(TCG_TYPE_V128);
+                tcg_gen_ld_vec(x1, tcg_env, vreg_ofs(s, src1 + r) + h);
+            }
+            switch (form) {
+            case FPV_VV:
+                tcg_gen_fpop2_vec(s->sew, res, x2, x1, fpop);
+                break;
+            case FPV_RV:
+                tcg_gen_fpop2_vec(s->sew, res, x1, x2, fpop);
+                break;
+            case FPV_V:
+                tcg_gen_fpop1_vec(s->sew, res, x2, fpop);
+                break;
+            case FPV_ACC:
+            case FPV_MADD:
+                {
+                    TCGv_vec xd = tcg_temp_new_vec(TCG_TYPE_V128);
+
+                    tcg_gen_ld_vec(xd, tcg_env, vreg_ofs(s, vd + r) + h);
+                    if (form == FPV_ACC) {
+                        tcg_gen_fpop3_vec(s->sew, res, x1, x2, xd, fpop);
+                    } else {
+                        tcg_gen_fpop3_vec(s->sew, res, x1, xd, x2, fpop);
+                    }
+                }
+                break;
+            }
+            tcg_gen_st_vec(res, tcg_env, vreg_ofs(s, vd + r) + h);
+        }
+    }
+    mark_vs_dirty(s);
+    finalize_rvv_inst(s);
+    return true;
+}
+#else
+static bool fpv_inline(DisasContext *s, const char *name, int vd, int src1,
+                       int vs2, bool vm)
+{
+    return false;
+}
+#endif
+
 /* OPFVV without GVEC IR */
 #define GEN_OPFVV_TRANS(NAME, CHECK)                               \
 static bool trans_##NAME(DisasContext *s, arg_rmrr *a)             \
 {                                                                  \
     if (CHECK(s, a, -1)) {                                         \
         uint32_t data = 0;                                         \
+        if (fpv_inline(s, #NAME, a->rd, a->rs1, a->rs2, a->vm)) {  \
+            return true;                                           \
+        }                                                          \
         static gen_helper_gvec_4_ptr * const fns[3] = {            \
             gen_helper_##NAME##_h,                                 \
             gen_helper_##NAME##_w,                                 \
@@ -3245,6 +3377,9 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                  \
 {                                                                       \
     if (CHECK(s, a, MO_16)) {                                           \
         uint32_t data = 0;                                              \
+        if (fpv_inline(s, #NAME, a->rd, a->rs1, a->rs2, a->vm)) {       \
+            return true;                                                \
+        }                                                               \
         static gen_helper_gvec_4_ptr * const fns[3] = {                 \
             gen_helper_##NAME##_h,                                      \
             gen_helper_##NAME##_w,                                      \
@@ -3324,6 +3459,9 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)  \
 {                                                       \
     if (CHECK(s, a, -1)) {                              \
         uint32_t data = 0;                              \
+        if (fpv_inline(s, #NAME, a->rd, a->rs1, a->rs2, a->vm)) { \
+            return true;                                \
+        }                                               \
         static gen_helper_opfvf *const fns[3] = {       \
             gen_helper_##NAME##_h,                      \
             gen_helper_##NAME##_w,                      \
@@ -3347,6 +3485,9 @@ static bool trans_##NAME(DisasContext *s, arg_rmrr *a)              \
 {                                                                   \
     if (CHECK(s, a, MO_16)) {                                       \
         uint32_t data = 0;                                          \
+        if (fpv_inline(s, #NAME, a->rd, a->rs1, a->rs2, a->vm)) {   \
+            return true;                                            \
+        }                                                           \
         static gen_helper_opfvf *const fns[3] = {                   \
             gen_helper_##NAME##_h,                                  \
             gen_helper_##NAME##_w,                                  \
@@ -3685,7 +3826,20 @@ static bool trans_##NAME(DisasContext *s, arg_rmr *a)           \
                    CHECK, FRM, MO_16);                          \
 }
 
-GEN_OPFV_TRANS(vfsqrt_v, opfv_check, RISCV_FRM_DYN)
+static bool trans_vfsqrt_v(DisasContext *s, arg_rmr *a)
+{
+    static gen_helper_gvec_3_ptr * const fns[3] = {
+        gen_helper_vfsqrt_v_h,
+        gen_helper_vfsqrt_v_w,
+        gen_helper_vfsqrt_v_d
+    };
+
+    if (opfv_check(s, a, -1)
+        && fpv_inline(s, "vfsqrt_v", a->rd, 0, a->rs2, a->vm)) {
+        return true;
+    }
+    return do_opfv(s, a, fns[s->sew - 1], opfv_check, RISCV_FRM_DYN, -1);
+}
 GEN_OPFV_BFA_TRANS(vfrsqrt7_v, opfv_check, RISCV_FRM_DYN)
 GEN_OPFV_BFA_TRANS(vfrec7_v, opfv_check, RISCV_FRM_DYN)
 
