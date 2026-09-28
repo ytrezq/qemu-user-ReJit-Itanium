@@ -502,6 +502,15 @@ void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d);
 
+void tcg_gen_fpop1_vec(unsigned vece, TCGv_vec r, TCGv_vec a, unsigned fpop);
+void tcg_gen_fpop2_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                       unsigned fpop);
+void tcg_gen_fpop3_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                       TCGv_vec c, unsigned fpop);
+void tcg_gen_fpcmpcc_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
+                         unsigned fpop);
+void tcg_gen_perm2b_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx);
+
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);

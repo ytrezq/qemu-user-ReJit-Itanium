@@ -861,6 +861,7 @@ enum {
     HFLAGS_DR = 4,   /* MSR_DR */
     HFLAGS_HR = 5,   /* computed from SPR_LPCR[HR] */
     HFLAGS_SPE = 6,  /* from MSR_SPE if cpu has SPE; avoid overlap w/ MSR_VR */
+    HFLAGS_FP_SOFT = 7, /* FPSCR & FP_SOFT_MASK: FP insns use softfloat */
     HFLAGS_TM = 8,   /* computed from MSR_TM */
     HFLAGS_BE = 9,   /* MSR_BE -- from elsewhere on embedded ppc */
     HFLAGS_SE = 10,  /* MSR_SE -- from elsewhere on embedded ppc */
@@ -966,6 +967,12 @@ FIELD(FPSCR, FI, FPSCR_FI, 1)
 #define FP_RN           (FP_RN1 | FP_RN0)
 
 #define FP_ENABLES      (FP_VE | FP_OE | FP_UE | FP_ZE | FP_XE)
+/*
+ * FP instructions only run as host FP code (see fpu-host.h) with all FP
+ * exceptions disabled and round-to-nearest; otherwise HFLAGS_FP_SOFT is set
+ * and they use the softfloat helpers.
+ */
+#define FP_SOFT_MASK    (FP_ENABLES | FP_RN)
 #define FP_STATUS       (FP_FR | FP_FI | FP_FPRF)
 
 /* the exception bits which can be cleared by mcrfs - includes FX */
@@ -1363,6 +1370,16 @@ struct CPUArchState {
     float_status vec_status;
     float_status fp_status; /* Floating point execution context */
     target_ulong fpscr;     /* Floating point status and control register */
+    /*
+     * FP instructions compiled to host FP code (TCG fpop ops) leave their
+     * exception flags in the host FP status register and their FPRF in
+     * fprf_val; ppc_fpscr_sync() folds both into fpscr.  fprf_lazy holds
+     * PPC_FPRF_LAZY_* bits saying what is pending, fp_host_used is set by
+     * the other ones: while both are 0 there is nothing to fold.
+     */
+    uint64_t fprf_val;
+    uint32_t fprf_lazy;
+    uint32_t fp_host_used;
 
     /* Internal devices resources */
     ppc_tb_t *tb_env;      /* Time base and decrementer */
@@ -1710,6 +1727,9 @@ void cpu_ppc_set_1lpar(PowerPCCPU *cpu);
 #endif
 
 void ppc_store_fpscr(CPUPPCState *env, target_ulong val);
+void ppc_fpscr_sync(CPUPPCState *env);
+#define PPC_FPRF_LAZY_RESULT    1   /* FPRF is the class of fprf_val */
+#define PPC_FPRF_LAZY_FPCC      2   /* ... except FPCC, which is in fpscr */
 void helper_hfscr_facility_check(CPUPPCState *env, uint32_t bit,
                                  const char *caller, uint32_t cause);
 

@@ -311,6 +311,7 @@ static void save_user_regs(CPUPPCState *env, struct target_mcontext *frame)
             uint64_t *fpr = cpu_fpr_ptr(env, i);
             __put_user(*fpr, &frame->mc_fregs[i]);
         }
+        ppc_fpscr_sync(env);
         __put_user((uint64_t) env->fpscr, &frame->mc_fregs[32]);
     }
 
@@ -460,8 +461,8 @@ void setup_frame(int sig, struct target_sigaction *ka,
 
     env->lr = default_sigreturn;
 
-    /* Turn off all fp exceptions.  */
-    env->fpscr = 0;
+    /* Turn off all fp exceptions (and mirror that in the host FP state).  */
+    ppc_store_fpscr(env, 0);
 
     /* Create a stack frame for the caller of the handler.  */
     newsp = frame_addr - SIGNAL_FRAMESIZE;
@@ -533,8 +534,8 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
 
     env->lr = default_rt_sigreturn;
 
-    /* Turn off all fp exceptions.  */
-    env->fpscr = 0;
+    /* Turn off all fp exceptions (and mirror that in the host FP state).  */
+    ppc_store_fpscr(env, 0);
 
     /* Create a stack frame for the caller of the handler.  */
     newsp = rt_sf_addr - (SIGNAL_FRAMESIZE + RT_SIGFRAME_ADJUST);

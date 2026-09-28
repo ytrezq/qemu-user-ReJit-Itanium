@@ -7659,6 +7659,7 @@ void ppc_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                 qemu_fprintf(f, "\n");
             }
         }
+        ppc_fpscr_sync(env);
         qemu_fprintf(f, "FPSCR " TARGET_FMT_lx "\n", env->fpscr);
     }
 

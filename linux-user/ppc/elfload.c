@@ -9,7 +9,8 @@
 const char *get_elf_cpu_model(uint32_t eflags)
 {
 #ifdef TARGET_PPC64
-    return "POWER9";
+    /* this build targets IBM Power11 (Power ISA 3.1); -cpu/QEMU_CPU override */
+    return "power11";
 #else
     return "750";
 #endif

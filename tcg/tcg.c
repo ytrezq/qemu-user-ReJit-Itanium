@@ -845,7 +845,9 @@ static int tcg_out_pool_finalize(TCGContext *s)
 #define C_O1_I3(O1, I1, I2, I3)         C_PFX4(c_o1_i3_, O1, I1, I2, I3),
 #define C_O1_I4(O1, I1, I2, I3, I4)     C_PFX5(c_o1_i4_, O1, I1, I2, I3, I4),
 
+#define C_N1_I1(O1, I1)                 C_PFX2(c_n1_i1_, O1, I1),
 #define C_N1_I2(O1, I1, I2)             C_PFX3(c_n1_i2_, O1, I1, I2),
+#define C_N1_I3(O1, I1, I2, I3)         C_PFX4(c_n1_i3_, O1, I1, I2, I3),
 #define C_N1O1_I1(O1, O2, I1)           C_PFX3(c_n1o1_i1_, O1, O2, I1),
 #define C_N2_I1(O1, O2, I1)             C_PFX3(c_n2_i1_, O1, O2, I1),
 
@@ -871,7 +873,9 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode, TCGType, unsigned);
 #undef C_O1_I2
 #undef C_O1_I3
 #undef C_O1_I4
+#undef C_N1_I1
 #undef C_N1_I2
+#undef C_N1_I3
 #undef C_N1O1_I1
 #undef C_N2_I1
 #undef C_O2_I1
@@ -897,7 +901,9 @@ typedef struct TCGConstraintSet {
 #define C_O1_I3(O1, I1, I2, I3)         { 1, 3, { #O1, #I1, #I2, #I3 } },
 #define C_O1_I4(O1, I1, I2, I3, I4)     { 1, 4, { #O1, #I1, #I2, #I3, #I4 } },
 
+#define C_N1_I1(O1, I1)                 { 1, 1, { "&" #O1, #I1 } },
 #define C_N1_I2(O1, I1, I2)             { 1, 2, { "&" #O1, #I1, #I2 } },
+#define C_N1_I3(O1, I1, I2, I3)         { 1, 3, { "&" #O1, #I1, #I2, #I3 } },
 #define C_N1O1_I1(O1, O2, I1)           { 2, 1, { "&" #O1, #O2, #I1 } },
 #define C_N2_I1(O1, O2, I1)             { 2, 1, { "&" #O1, "&" #O2, #I1 } },
 
@@ -919,7 +925,9 @@ static const TCGConstraintSet constraint_sets[] = {
 #undef C_O1_I2
 #undef C_O1_I3
 #undef C_O1_I4
+#undef C_N1_I1
 #undef C_N1_I2
+#undef C_N1_I3
 #undef C_N1O1_I1
 #undef C_N2_I1
 #undef C_O2_I1
@@ -940,7 +948,9 @@ static const TCGConstraintSet constraint_sets[] = {
 #define C_O1_I3(O1, I1, I2, I3)         C_PFX4(c_o1_i3_, O1, I1, I2, I3)
 #define C_O1_I4(O1, I1, I2, I3, I4)     C_PFX5(c_o1_i4_, O1, I1, I2, I3, I4)
 
+#define C_N1_I1(O1, I1)                 C_PFX2(c_n1_i1_, O1, I1)
 #define C_N1_I2(O1, I1, I2)             C_PFX3(c_n1_i2_, O1, I1, I2)
+#define C_N1_I3(O1, I1, I2, I3)         C_PFX4(c_n1_i3_, O1, I1, I2, I3)
 #define C_N1O1_I1(O1, O2, I1)           C_PFX3(c_n1o1_i1_, O1, O2, I1)
 #define C_N2_I1(O1, O2, I1)             C_PFX3(c_n2_i1_, O1, O2, I1)
 
@@ -2457,6 +2467,13 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_bitsel_vec;
     case INDEX_op_cmpsel_vec:
         return has_type && TCG_TARGET_HAS_cmpsel_vec;
+    case INDEX_op_fpop1_vec:
+    case INDEX_op_fpop2_vec:
+    case INDEX_op_fpop3_vec:
+    case INDEX_op_fpcmpcc_vec:
+        return has_type && TCG_TARGET_HAS_fpop_vec;
+    case INDEX_op_perm2b_vec:
+        return has_type && TCG_TARGET_HAS_perm2b_vec;
 
     default:
         if (op < INDEX_op_last_generic) {
@@ -2487,6 +2504,21 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_last_generic:
         g_assert_not_reached();
     }
+}
+
+bool tcg_can_emit_fpop(unsigned fpop, TCGType type, unsigned vece)
+{
+#ifdef TCG_TARGET_FPOP
+    return tcg_op_supported(INDEX_op_fpop2_vec, type, 0)
+        && tcg_target_can_emit_fpop(fpop, type, vece);
+#else
+    return false;
+#endif
+}
+
+bool tcg_can_emit_perm2b(TCGType type)
+{
+    return tcg_op_supported(INDEX_op_perm2b_vec, type, 0);
 }
 
 bool tcg_op_deposit_valid(TCGType type, unsigned ofs, unsigned len)

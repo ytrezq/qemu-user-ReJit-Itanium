@@ -23,6 +23,7 @@
 #include "user-internals.h"
 #include "user/cpu_loop.h"
 #include "signal-common.h"
+#include "tcg/tcg-fpop.h"
 
 static inline uint64_t cpu_ppc_get_tb(CPUPPCState *env)
 {
@@ -70,6 +71,7 @@ void cpu_loop(CPUPPCState *env)
     CPUState *cs = env_cpu(env);
     int trapnr, si_signo, si_code;
     target_ulong ret;
+    uint32_t fpenv;
 
     for(;;) {
         bool arch_interrupt;
@@ -333,9 +335,16 @@ void cpu_loop(CPUPPCState *env)
              */
             env->crf[0] &= ~0x1;
             env->nip += 4;
+            /*
+             * Make FPSCR exact before e.g. clone() copies it, and do not
+             * let host code in the syscall leave host FP flags behind.
+             */
+            ppc_fpscr_sync(env);
+            fpenv = tcg_host_fpenv_save();
             ret = do_syscall(env, env->gpr[0], env->gpr[3], env->gpr[4],
                              env->gpr[5], env->gpr[6], env->gpr[7],
                              env->gpr[8], 0, 0);
+            tcg_host_fpenv_restore(fpenv);
             if (ret == -QEMU_ERESTARTSYS) {
                 env->nip -= 4;
                 break;

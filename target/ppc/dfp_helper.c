@@ -148,6 +148,7 @@ static void dfp_prepare_decimal64(struct PPC_DFP *dfp, ppc_fprp_t *a,
                                   ppc_fprp_t *b, CPUPPCState *env)
 {
     decContextDefault(&dfp->context, DEC_INIT_DECIMAL64);
+    ppc_fpscr_sync(env);
     dfp_prepare_rounding_mode(&dfp->context, env->fpscr);
     dfp->env = env;
 
@@ -172,6 +173,7 @@ static void dfp_prepare_decimal128(struct PPC_DFP *dfp, ppc_fprp_t *a,
                                    ppc_fprp_t *b, CPUPPCState *env)
 {
     decContextDefault(&dfp->context, DEC_INIT_DECIMAL128);
+    ppc_fpscr_sync(env);
     dfp_prepare_rounding_mode(&dfp->context, env->fpscr);
     dfp->env = env;
 

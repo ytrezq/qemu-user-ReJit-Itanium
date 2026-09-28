@@ -793,3 +793,62 @@ void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
     }
     tcg_swap_vecop_list(hold_list);
 }
+
+/*
+ * Host floating point, see tcg/tcg-fpop.h.  These have no generic
+ * expansion: front ends check tcg_can_emit_fpop() first.
+ */
+void tcg_gen_fpop1_vec(unsigned vece, TCGv_vec r, TCGv_vec a, unsigned fpop)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(tcg_can_emit_fpop(fpop, rt->base_type, vece));
+    vec_gen_3(INDEX_op_fpop1_vec, rt->base_type, vece,
+              temp_arg(rt), tcgv_vec_arg(a), fpop);
+}
+
+void tcg_gen_fpop2_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                       unsigned fpop)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(tcg_can_emit_fpop(fpop, rt->base_type, vece));
+    vec_gen_4(INDEX_op_fpop2_vec, rt->base_type, vece,
+              temp_arg(rt), tcgv_vec_arg(a), tcgv_vec_arg(b), fpop);
+}
+
+void tcg_gen_fpop3_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                       TCGv_vec c, unsigned fpop)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGOp *op;
+
+    tcg_debug_assert(tcg_can_emit_fpop(fpop, rt->base_type, vece));
+    op = tcg_emit_op(INDEX_op_fpop3_vec, 5);
+    TCGOP_TYPE(op) = rt->base_type;
+    TCGOP_VECE(op) = vece;
+    op->args[0] = temp_arg(rt);
+    op->args[1] = tcgv_vec_arg(a);
+    op->args[2] = tcgv_vec_arg(b);
+    op->args[3] = tcgv_vec_arg(c);
+    op->args[4] = fpop;
+}
+
+void tcg_gen_fpcmpcc_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
+                         unsigned fpop)
+{
+    TCGType type = tcgv_vec_temp(a)->base_type;
+
+    tcg_debug_assert(tcg_can_emit_fpop(fpop, type, vece));
+    vec_gen_4(INDEX_op_fpcmpcc_vec, type, vece, tcgv_i32_arg(r),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), fpop);
+}
+
+void tcg_gen_perm2b_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(tcg_can_emit_perm2b(rt->base_type));
+    vec_gen_4(INDEX_op_perm2b_vec, rt->base_type, MO_8, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), tcgv_vec_arg(idx));
+}

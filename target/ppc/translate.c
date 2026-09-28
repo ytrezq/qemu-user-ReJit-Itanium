@@ -24,6 +24,7 @@
 #include "exec/target_page.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
+#include "tcg/tcg-fpop.h"
 #include "qemu/host-utils.h"
 
 #include "exec/helper-proto.h"
@@ -185,6 +186,7 @@ struct DisasContext {
     bool has_bhrb;
 #endif
     bool fpu_enabled;
+    bool fp_jit;        /* FP insns as host FP code, see tcg/tcg-fpop.h */
     bool altivec_enabled;
     bool vsx_enabled;
     bool spe_enabled;
@@ -208,6 +210,17 @@ struct DisasContext {
 #define DISAS_EXIT_UPDATE  DISAS_TARGET_1  /* exit to main loop, pc stale */
 #define DISAS_CHAIN        DISAS_TARGET_2  /* lookup next tb, pc updated */
 #define DISAS_CHAIN_UPDATE DISAS_TARGET_3  /* lookup next tb, pc stale */
+
+static bool ppc_fp_jit_allowed(void)
+{
+    static int allowed = -1;
+
+    if (allowed < 0) {
+        const char *e = getenv("QEMU_PPC_FPJIT");
+        allowed = !(e && e[0] == '0');
+    }
+    return allowed;
+}
 
 static inline bool is_ppe(const DisasContext *ctx)
 {
@@ -6560,6 +6573,13 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
         || env->mmu_model & POWERPC_MMU_64;
 
     ctx->fpu_enabled = (hflags >> HFLAGS_FP) & 1;
+    /*
+     * With an FP exception enabled, keep the softfloat helpers: they
+     * raise the exceptions precisely.  QEMU_PPC_FPJIT=0 disables the
+     * host FP code, e.g. to compare results.
+     */
+    ctx->fp_jit = !((hflags >> HFLAGS_FP_SOFT) & 1) && ppc_fp_jit_allowed()
+                  && tcg_can_emit_fpop(TCG_FPOP_ADD, TCG_TYPE_V64, MO_64);
     ctx->spe_enabled = (hflags >> HFLAGS_SPE) & 1;
     ctx->altivec_enabled = (hflags >> HFLAGS_VR) & 1;
     ctx->vsx_enabled = (hflags >> HFLAGS_VSX) & 1;

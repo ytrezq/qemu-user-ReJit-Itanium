@@ -179,6 +179,10 @@ static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
     if ((ppc_flags & POWERPC_FLAG_TM) && (msr & (1ull << MSR_TM))) {
         hflags |= 1 << HFLAGS_TM;
     }
+    if (env->fpscr & FP_SOFT_MASK) {
+        /* FP ops must use the helpers: FP exceptions or directed rounding */
+        hflags |= 1 << HFLAGS_FP_SOFT;
+    }
     if (env->spr[SPR_LPCR] & LPCR_GTSE) {
         hflags |= 1 << HFLAGS_GTSE;
     }

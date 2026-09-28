@@ -178,6 +178,18 @@ DEF(cmp_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(bitsel_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 
+/* Host floating point, see tcg/tcg-fpop.h.  The constant is the TCGFPOp. */
+DEF(fpop1_vec, 1, 1, 1, TCG_OPF_VECTOR)
+DEF(fpop2_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(fpop3_vec, 1, 3, 1, TCG_OPF_VECTOR)
+/* i32 output with a TCG_FPCC_* bit: compare of the scalar elements. */
+DEF(fpcmpcc_vec, 1, 2, 1, TCG_OPF_VECTOR)
+/*
+ * Byte permute of the 32-byte concatenation a:b (a supplies bytes 0-15),
+ * d[i] = (a:b)[idx[i] & 31], in host element order.
+ */
+DEF(perm2b_vec, 1, 3, 0, TCG_OPF_VECTOR)
+
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
 #include "tcg-target-opc.h.inc"

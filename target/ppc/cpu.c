@@ -27,6 +27,7 @@
 #include "mmu-hash64.h"
 #include "helper_regs.h"
 #include "system/tcg.h"
+#include "fpu-host.h"
 
 target_ulong cpu_read_xer(const CPUPPCState *env)
 {
@@ -254,5 +255,19 @@ void ppc_store_fpscr(CPUPPCState *env, target_ulong val)
     set_float_rebias_underflow(FP_UE & env->fpscr, &env->fp_status);
     if (tcg_enabled()) {
         fpscr_set_rounding_mode(env);
+        /*
+         * val is the whole architected FPSCR: drop whatever the host FP
+         * code left pending (callers that merge into the old value have
+         * folded it first, see ppc_fpscr_sync).
+         */
+        env->fprf_lazy = 0;
+        env->fp_host_used = 0;
+#ifdef PPC_HOST_FPENV
+        ppc_host_fp_set(ppc_host_fp_get() & ~PPC_HOST_FLAGS);
+#endif
+        /* FP exceptions or directed rounding may have been turned on/off */
+        if ((env->hflags >> HFLAGS_FP_SOFT ^ !!(val & FP_SOFT_MASK)) & 1) {
+            env->hflags ^= 1 << HFLAGS_FP_SOFT;
+        }
     }
 }

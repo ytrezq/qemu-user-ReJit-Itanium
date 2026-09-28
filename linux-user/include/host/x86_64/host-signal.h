@@ -28,6 +28,21 @@ static inline void *host_signal_mask(host_sigcontext *uc)
     return &uc->uc_sigmask;
 }
 
+/*
+ * Signal handlers start with a clean FP state and host_signal_handler()
+ * may siglongjmp() out of them, which would drop the MXCSR exception flags
+ * accumulated by generated code (see tcg/tcg-fpop.h): reload the
+ * interrupted MXCSR on entry.
+ */
+#define HAVE_HOST_SIGNAL_RESTORE_FPENV 1
+static inline void host_signal_restore_fpenv(host_sigcontext *uc)
+{
+    if (uc->uc_mcontext.fpregs) {
+        uint32_t mxcsr = uc->uc_mcontext.fpregs->mxcsr;
+        asm volatile("ldmxcsr %0" : : "m"(mxcsr));
+    }
+}
+
 static inline bool host_signal_write(siginfo_t *info, host_sigcontext *uc)
 {
     return uc->uc_mcontext.gregs[REG_TRAPNO] == 0xe

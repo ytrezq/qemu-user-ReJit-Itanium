@@ -21,6 +21,7 @@
 #include "exec/helper-proto.h"
 #include "internal.h"
 #include "fpu/softfloat.h"
+#include "fpu-host.h"
 
 static inline float128 float128_snan_to_qnan(float128 x)
 {
@@ -140,11 +141,122 @@ static inline int ppc_float64_get_unbiased_exp(float64 f)
     return ((f >> 52) & 0x7FF) - 1023;
 }
 
+/* FPRF of a binary64 value, as helper_compute_fprf_float64 sets it */
+static uint32_t ppc_fprf_of_f64(uint64_t f)
+{
+    bool neg = f >> 63;
+    unsigned exp = extract64(f, 52, 11);
+    uint64_t frac = extract64(f, 0, 52);
+
+    if (exp == 0x7ff) {
+        if (frac == 0) {
+            return neg ? 0x09 : 0x05;
+        }
+        return frac >> 51 ? 0x11 : 0x00;
+    }
+    if (exp == 0) {
+        if (frac == 0) {
+            return neg ? 0x12 : 0x02;
+        }
+        return neg ? 0x18 : 0x14;
+    }
+    return neg ? 0x08 : 0x04;
+}
+
+/*
+ * Bring env->fpscr up to date after FP instructions that ran as host FP
+ * code: their sticky exception flags are in the host status register and
+ * the result that sets FPRF is in env->fprf_val.
+ *
+ * The host only has one invalid-operation flag, reported as VXSOFT (so
+ * FPSCR[VX] and fetestexcept(FE_INVALID) are right, not the VX* detail).
+ * FI tells whether any of these host operations was inexact, and FR is
+ * cleared.
+ */
+static void ppc_fpscr_fold(CPUPPCState *env)
+{
+    target_ulong fpscr = env->fpscr;
+    bool inexact = false;
+
+#ifdef PPC_HOST_FPENV
+    uint32_t m = ppc_host_fp_get();
+    uint32_t fl = m & (PPC_HOST_FLAGS & ~PPC_HOST_FLAG_DE);
+
+    if (fl) {
+        target_ulong add = 0;
+
+        if (fl & PPC_HOST_FLAG_IE) {
+            add |= FP_VXSOFT | FP_VX;
+        }
+        if (fl & PPC_HOST_FLAG_ZE) {
+            add |= FP_ZX;
+        }
+        if (fl & PPC_HOST_FLAG_OE) {
+            add |= FP_OX;
+        }
+        if (fl & PPC_HOST_FLAG_UE) {
+            add |= FP_UX;
+        }
+        if (fl & PPC_HOST_FLAG_PE) {
+            add |= FP_XX;
+            inexact = true;
+        }
+        if (add & ~fpscr) {
+            fpscr |= FP_FX;
+        }
+        fpscr |= add;
+        ppc_host_fp_set(m & ~PPC_HOST_FLAGS);
+    }
+#endif
+    if (env->fprf_lazy & PPC_FPRF_LAZY_RESULT) {
+        uint32_t fprf = ppc_fprf_of_f64(env->fprf_val);
+
+        /*
+         * A compare after the result already stored FPCC in fpscr: only
+         * the C bit still comes from the result.
+         */
+        if (env->fprf_lazy & PPC_FPRF_LAZY_FPCC) {
+            fpscr = deposit64(fpscr, FPSCR_C, 1, fprf >> 4);
+        } else {
+            fpscr = deposit64(fpscr, FPSCR_FPRF, 5, fprf);
+        }
+    }
+    if ((env->fprf_lazy & PPC_FPRF_LAZY_RESULT) || env->fp_host_used) {
+        /* arithmetic and conversions: FI approximated, see above */
+        fpscr &= ~FP_FR;
+        fpscr = FIELD_DP64(fpscr, FPSCR, FI, inexact);
+    }
+    env->fprf_lazy = 0;
+    env->fp_host_used = 0;
+    env->fpscr = fpscr;
+}
+
+/*
+ * Only host FP code generated for guest FP instructions leaves flags to
+ * fold: the translator and syscalls preserve the host flags (see
+ * tcg_host_fpenv_save()), host signal handlers restore them, softfloat's
+ * hardfloat paths (for FP instructions that still use helpers) only raise
+ * flags that the helper also reports, and the Altivec helpers, which do
+ * not touch FPSCR, preserve them.
+ */
+void ppc_fpscr_sync(CPUPPCState *env)
+{
+    if (unlikely(env->fprf_lazy | env->fp_host_used)) {
+        ppc_fpscr_fold(env);
+    }
+}
+
+void helper_fpscr_sync(CPUPPCState *env)
+{
+    ppc_fpscr_sync(env);
+}
+
 #define COMPUTE_FPRF(tp)                                          \
 void helper_compute_fprf_##tp(CPUPPCState *env, tp arg)           \
 {                                                                 \
     bool neg = tp##_is_neg(arg);                                  \
     target_ulong fprf;                                            \
+    ppc_fpscr_sync(env);                                          \
     if (likely(tp##_is_normal(arg))) {                            \
         fprf = neg ? 0x08 << FPSCR_FPRF : 0x04 << FPSCR_FPRF;     \
     } else if (tp##_is_zero(arg)) {                               \
@@ -356,6 +468,7 @@ static inline void float_inexact_excp(CPUPPCState *env)
 
 void helper_fpscr_clrbit(CPUPPCState *env, uint32_t bit)
 {
+    ppc_fpscr_sync(env);
     uint32_t mask = 1u << bit;
     if (env->fpscr & mask) {
         ppc_store_fpscr(env, env->fpscr & ~(target_ulong)mask);
@@ -364,6 +477,7 @@ void helper_fpscr_clrbit(CPUPPCState *env, uint32_t bit)
 
 void helper_fpscr_setbit(CPUPPCState *env, uint32_t bit)
 {
+    ppc_fpscr_sync(env);
     uint32_t mask = 1u << bit;
     if (!(env->fpscr & mask)) {
         ppc_store_fpscr(env, env->fpscr | mask);
@@ -372,6 +486,7 @@ void helper_fpscr_setbit(CPUPPCState *env, uint32_t bit)
 
 void helper_store_fpscr(CPUPPCState *env, uint64_t val, uint32_t nibbles)
 {
+    ppc_fpscr_sync(env);
     target_ulong mask = 0;
     int i;
 
@@ -436,6 +551,7 @@ static void do_fpscr_check_status(CPUPPCState *env, uintptr_t raddr)
 
 void helper_fpscr_check_status(CPUPPCState *env)
 {
+    ppc_fpscr_sync(env);
     do_fpscr_check_status(env, GETPC());
 }
 
@@ -444,6 +560,8 @@ static void do_float_check_status(CPUPPCState *env, bool change_fi,
 {
     CPUState *cs = env_cpu(env);
     int status = get_float_exception_flags(&env->fp_status);
+
+    ppc_fpscr_sync(env);
 
     if (status & float_flag_overflow) {
         status |= float_overflow_excp(env);
@@ -475,6 +593,7 @@ void helper_float_check_status(CPUPPCState *env)
 
 void helper_reset_fpstatus(CPUPPCState *env)
 {
+    ppc_fpscr_sync(env);
     set_float_exception_flags(0, &env->fp_status);
 }
 

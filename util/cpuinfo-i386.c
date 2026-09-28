@@ -58,6 +58,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
                     info |= (b7 & bit_AVX512BW ? CPUINFO_AVX512BW : 0);
                     info |= (b7 & bit_AVX512DQ ? CPUINFO_AVX512DQ : 0);
                     info |= (c7 & bit_AVX512VBMI2 ? CPUINFO_AVX512VBMI2 : 0);
+                    info |= (c7 & bit_AVX512VBMI ? CPUINFO_AVX512VBMI : 0);
+                    info |= (c7 & bit_AVX512BITALG ? CPUINFO_AVX512BITALG : 0);
                 }
 
                 /*

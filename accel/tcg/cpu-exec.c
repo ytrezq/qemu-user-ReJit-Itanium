@@ -32,6 +32,7 @@
 #include "exec/mmap-lock.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
+#include "tcg/tcg-fpop.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -576,9 +577,11 @@ void cpu_exec_step_atomic(CPUState *cpu)
 
         tb = tb_lookup(cpu, s);
         if (tb == NULL) {
+            uint32_t fpenv = tcg_host_fpenv_save();
             mmap_lock();
             tb = tb_gen_code(cpu, s);
             mmap_unlock();
+            tcg_host_fpenv_restore(fpenv);
         }
 
         cpu_exec_enter(cpu);
@@ -968,10 +971,13 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             if (tb == NULL) {
                 CPUJumpCache *jc;
                 uint32_t h;
+                /* keep the guest's host FP flags, see tcg-fpop.h */
+                uint32_t fpenv = tcg_host_fpenv_save();
 
                 mmap_lock();
                 tb = tb_gen_code(cpu, s);
                 mmap_unlock();
+                tcg_host_fpenv_restore(fpenv);
 
                 /*
                  * We add the TB in the virtual pc hash table

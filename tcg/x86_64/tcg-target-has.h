@@ -24,6 +24,8 @@
 #define have_avx512bw     ((cpuinfo & CPUINFO_AVX512BW) && have_avx512vl)
 #define have_avx512dq     ((cpuinfo & CPUINFO_AVX512DQ) && have_avx512vl)
 #define have_avx512vbmi2  ((cpuinfo & CPUINFO_AVX512VBMI2) && have_avx512vl)
+#define have_avx512vbmi   ((cpuinfo & CPUINFO_AVX512VBMI) && have_avx512vl)
+#define have_avx512bitalg ((cpuinfo & CPUINFO_AVX512BITALG) && have_avx512vl)
 
 /* optional instructions */
 /* Keep 32-bit values zero-extended in a register.  */
@@ -58,6 +60,11 @@
 #define TCG_TARGET_HAS_bitsel_vec       have_avx512vl
 #define TCG_TARGET_HAS_cmpsel_vec       1
 #define TCG_TARGET_HAS_tst_vec          have_avx512bw
+
+/* Host floating point (tcg/tcg-fpop.h) is implemented with AVX-512 only. */
+#define TCG_TARGET_FPOP                 1
+#define TCG_TARGET_HAS_fpop_vec         (have_avx512bw && have_avx512dq)
+#define TCG_TARGET_HAS_perm2b_vec       have_avx512vbmi
 
 #define TCG_TARGET_deposit_valid(type, ofs, len) \
     ((ofs) == 0 && ((len) == 8 || (len) == 16))

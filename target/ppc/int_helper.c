@@ -32,6 +32,7 @@
 #include "tcg/tcg-gvec-desc.h"
 
 #include "helper_regs.h"
+#include "fpu-host.h"
 /*****************************************************************************/
 /* Fixed point operations helpers */
 
@@ -508,11 +509,13 @@ void helper_VPRTYBQ(ppc_avr_t *r, ppc_avr_t *b, uint32_t v)
     void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
                           ppc_avr_t *b)                                 \
     {                                                                   \
+        uint32_t host_fp = ppc_host_fp_save();                          \
         int i;                                                          \
                                                                         \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
             r->f32[i] = func(a->f32[i], b->f32[i], &env->vec_status);   \
         }                                                               \
+        ppc_host_fp_restore(host_fp);                                   \
     }
 VARITHFP(addfp, float32_add)
 VARITHFP(subfp, float32_sub)
@@ -524,11 +527,13 @@ VARITHFP(maxfp, float32_max)
     void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
                            ppc_avr_t *b, ppc_avr_t *c)                  \
     {                                                                   \
+        uint32_t host_fp = ppc_host_fp_save();                          \
         int i;                                                          \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
             r->f32[i] = float32_muladd(a->f32[i], c->f32[i], b->f32[i], \
                                        type, &env->vec_status);         \
         }                                                               \
+        ppc_host_fp_restore(host_fp);                                   \
     }
 VARITHFPFMA(maddfp, 0);
 VARITHFPFMA(nmsubfp, float_muladd_negate_result | float_muladd_negate_c);
@@ -647,6 +652,7 @@ VCMPNEZ(VCMPNEZW, u32)
         uint32_t ones = (uint32_t)-1;                                   \
         uint32_t all = ones;                                            \
         uint32_t none = 0;                                              \
+        uint32_t host_fp = ppc_host_fp_save();                          \
         int i;                                                          \
                                                                         \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
@@ -665,6 +671,7 @@ VCMPNEZ(VCMPNEZW, u32)
             all &= result;                                              \
             none |= result;                                             \
         }                                                               \
+        ppc_host_fp_restore(host_fp);                                   \
         if (record) {                                                   \
             env->crf[6] = ((all != 0) << 3) | ((none == 0) << 1);       \
         }                                                               \
@@ -681,6 +688,7 @@ VCMPFP(gtfp, ==, float_relation_greater)
 static inline void vcmpbfp_internal(CPUPPCState *env, ppc_avr_t *r,
                                     ppc_avr_t *a, ppc_avr_t *b, int record)
 {
+    uint32_t host_fp = ppc_host_fp_save();
     int i;
     int all_in = 0;
 
@@ -701,6 +709,7 @@ static inline void vcmpbfp_internal(CPUPPCState *env, ppc_avr_t *r,
             all_in |= (!le | !ge);
         }
     }
+    ppc_host_fp_restore(host_fp);
     if (record) {
         env->crf[6] = (all_in == 0) << 1;
     }
@@ -1525,11 +1534,13 @@ VPK(udum, u64, u32, I, 0)
 
 void helper_vrefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 {
+    uint32_t host_fp = ppc_host_fp_save();
     int i;
 
     for (i = 0; i < ARRAY_SIZE(r->f32); i++) {
         r->f32[i] = float32_div(float32_one, b->f32[i], &env->vec_status);
     }
+    ppc_host_fp_restore(host_fp);
 }
 
 #define VRFI(suffix, rounding)                                  \
@@ -1552,6 +1563,7 @@ VRFI(z, float_round_to_zero)
 
 void helper_vrsqrtefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 {
+    uint32_t host_fp = ppc_host_fp_save();
     int i;
 
     for (i = 0; i < ARRAY_SIZE(r->f32); i++) {
@@ -1559,6 +1571,7 @@ void helper_vrsqrtefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 
         r->f32[i] = float32_div(float32_one, t, &env->vec_status);
     }
+    ppc_host_fp_restore(host_fp);
 }
 
 #define VRLMI(name, size, element, insert)                                  \
@@ -1591,20 +1604,24 @@ VRLMI(VRLWNM, 32, u32, 0);
 
 void helper_vexptefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 {
+    uint32_t host_fp = ppc_host_fp_save();
     int i;
 
     for (i = 0; i < ARRAY_SIZE(r->f32); i++) {
         r->f32[i] = float32_exp2(b->f32[i], &env->vec_status);
     }
+    ppc_host_fp_restore(host_fp);
 }
 
 void helper_vlogefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 {
+    uint32_t host_fp = ppc_host_fp_save();
     int i;
 
     for (i = 0; i < ARRAY_SIZE(r->f32); i++) {
         r->f32[i] = float32_log2(b->f32[i], &env->vec_status);
     }
+    ppc_host_fp_restore(host_fp);
 }
 
 #define VEXTU_X_DO(name, size, left)                            \

@@ -19,24 +19,159 @@ static inline void gen_compute_fprf_float64(TCGv_i64 arg)
 static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
+    gen_helper_fpscr_sync(tcg_env);
     tcg_gen_trunc_tl_i32(tmp, cpu_fpscr);
     tcg_gen_shri_i32(cpu_crf[1], tmp, 28);
 }
 #else
 static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 {
+    gen_helper_fpscr_sync(tcg_env);
     tcg_gen_shri_tl(cpu_crf[1], cpu_fpscr, 28);
 }
 #endif
 
+/*
+ * FP instructions as host FP code (ctx->fp_jit, see tcg/tcg-fpop.h).
+ * Operands are loaded from and stored back to env for each instruction;
+ * TCG keeps them in host vector registers within a TB when it can.
+ * Exception flags accumulate in the host FP status register and FPRF is
+ * kept as the result that defines it: ppc_fpscr_sync() rebuilds FPSCR
+ * whenever it is read.
+ */
+static TCGv_vec fpj_ld(int reg)
+{
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V64);
+    tcg_gen_ld_vec(v, tcg_env, fpr_offset(reg));
+    return v;
+}
+
+static void fpj_set_fprf(TCGv_vec v)
+{
+    tcg_gen_st_vec(v, tcg_env, offsetof(CPUPPCState, fprf_val));
+    tcg_gen_st_i32(tcg_constant_i32(PPC_FPRF_LAZY_RESULT), tcg_env,
+                   offsetof(CPUPPCState, fprf_lazy));
+}
+
+static void fpj_st(int reg, TCGv_vec v, bool set_fprf)
+{
+    tcg_gen_st_vec(v, tcg_env, fpr_offset(reg));
+    /* doubleword 1 of the VSR is 0, as set_fpr() does */
+    tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(reg, false));
+    if (set_fprf) {
+        fpj_set_fprf(v);
+    } else {
+        tcg_gen_st_i32(tcg_constant_i32(1), tcg_env,
+                       offsetof(CPUPPCState, fp_host_used));
+    }
+}
+
+static bool do_fpj_2(DisasContext *ctx, int t, int a, int b, bool rc,
+                     unsigned fpop)
+{
+    TCGv_vec va = fpj_ld(a);
+    TCGv_vec vb = fpj_ld(b);
+    TCGv_vec vt = tcg_temp_new_vec(TCG_TYPE_V64);
+
+    tcg_gen_fpop2_vec(MO_64, vt, va, vb, fpop | TCG_FPOP_F_DEFNAN);
+    fpj_st(t, vt, true);
+    if (unlikely(rc)) {
+        gen_set_cr1_from_fpscr(ctx);
+    }
+    return true;
+}
+
+/*
+ * DOUBLE(), the non-arithmetic single -> double conversion of loads, in
+ * generated code: helper_todouble() is only called for denormals.
+ */
+static void gen_todouble(TCGv_i64 ret, TCGv_i32 arg)
+{
+    TCGv_i64 x = tcg_temp_new_i64();
+    TCGv_i64 r = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64();
+    TCGv_i64 e = tcg_temp_new_i64();
+    TCGv_i64 abs = tcg_temp_new_i64();
+    TCGLabel *done = gen_new_label();
+
+    tcg_gen_extu_i32_i64(x, arg);
+    /* normal: WORD[0:1] || ~WORD[1] x3 || WORD[2:31] || 0 x29 */
+    tcg_gen_shli_i64(r, x, 29);
+    tcg_gen_andi_i64(r, r, MAKE_64BIT_MASK(29, 30));
+    tcg_gen_andi_i64(t, x, 0xc0000000);
+    tcg_gen_shli_i64(t, t, 32);
+    tcg_gen_or_i64(r, r, t);
+    tcg_gen_extract_i64(e, x, 23, 8);
+    /* bits 59:61 are ones unless WORD[1] is set in a finite number */
+    tcg_gen_extract_i64(t, x, 30, 1);
+    tcg_gen_xori_i64(t, t, 1);
+    tcg_gen_setcondi_i64(TCG_COND_EQ, abs, e, 255);
+    tcg_gen_or_i64(t, t, abs);
+    tcg_gen_neg_i64(t, t);
+    tcg_gen_andi_i64(t, t, 7ull << 59);
+    tcg_gen_or_i64(r, r, t);
+    /* zero: just the sign */
+    tcg_gen_andi_i64(abs, x, 0x7fffffff);
+    tcg_gen_shli_i64(t, x, 32);
+    tcg_gen_andi_i64(t, t, INT64_MIN);
+    tcg_gen_movcond_i64(TCG_COND_EQ, r, abs, tcg_constant_i64(0), t, r);
+    /* denormal: rare, use the helper */
+    tcg_gen_brcondi_i64(TCG_COND_NE, e, 0, done);
+    tcg_gen_brcondi_i64(TCG_COND_EQ, abs, 0, done);
+    gen_helper_todouble(r, arg);
+    gen_set_label(done);
+    tcg_gen_mov_i64(ret, r);
+}
+
+/* SINGLE(), the conversion of stores; helper_tosingle() for denormals */
+static void gen_tosingle(TCGv_i32 ret, TCGv_i64 arg)
+{
+    TCGv_i64 r = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64();
+    TCGv_i64 e = tcg_temp_new_i64();
+    TCGv_i32 w = tcg_temp_new_i32();
+    TCGLabel *done = gen_new_label();
+
+    /* exp > 896: WORD = FRS[0:1] || FRS[5:34] */
+    tcg_gen_extract_i64(r, arg, 62, 2);
+    tcg_gen_shli_i64(r, r, 30);
+    tcg_gen_extract_i64(t, arg, 29, 30);
+    tcg_gen_or_i64(r, r, t);
+    /* otherwise just the sign, unless in the denormal range */
+    tcg_gen_extract_i64(e, arg, 52, 11);
+    tcg_gen_shri_i64(t, arg, 63);
+    tcg_gen_shli_i64(t, t, 31);
+    tcg_gen_movcond_i64(TCG_COND_GTU, r, e, tcg_constant_i64(896), r, t);
+    tcg_gen_extrl_i64_i32(w, r);
+    tcg_gen_brcondi_i64(TCG_COND_GTU, e, 896, done);
+    tcg_gen_brcondi_i64(TCG_COND_LTU, e, 874, done);
+    gen_helper_tosingle(w, arg);
+    gen_set_label(done);
+    tcg_gen_mov_i32(ret, w);
+}
+
 /***                       Floating-Point arithmetic                       ***/
 static bool do_helper_acb(DisasContext *ctx, arg_A *a,
                           void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
-                                         TCGv_i64, TCGv_i64))
+                                         TCGv_i64, TCGv_i64), unsigned fpop)
 {
     TCGv_i64 t0, t1, t2, t3;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
+    if (ctx->fp_jit) {
+        /* FRT = +-(FRA * FRC +- FRB), NaN priority A, B, C */
+        TCGv_vec va = fpj_ld(a->fra);
+        TCGv_vec vc = fpj_ld(a->frc);
+        TCGv_vec vb = fpj_ld(a->frb);
+        TCGv_vec vt = tcg_temp_new_vec(TCG_TYPE_V64);
+        tcg_gen_fpop3_vec(MO_64, vt, va, vc, vb, fpop | TCG_FPOP_FMA
+                          | TCG_FPOP_F_DEFNAN | TCG_FPOP_F_NAN_ACB);
+        fpj_st(a->frt, vt, true);
+        if (unlikely(a->rc)) {
+            gen_set_cr1_from_fpscr(ctx);
+        }
+        return true;
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
@@ -56,11 +191,14 @@ static bool do_helper_acb(DisasContext *ctx, arg_A *a,
 
 static bool do_helper_ab(DisasContext *ctx, arg_A_tab *a,
                          void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
-                                        TCGv_i64))
+                                        TCGv_i64), unsigned fpop)
 {
     TCGv_i64 t0, t1, t2;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
+    if (ctx->fp_jit) {
+        return do_fpj_2(ctx, a->frt, a->fra, a->frb, a->rc, fpop);
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
@@ -78,11 +216,14 @@ static bool do_helper_ab(DisasContext *ctx, arg_A_tab *a,
 
 static bool do_helper_ac(DisasContext *ctx, arg_A_tac *a,
                          void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
-                                        TCGv_i64))
+                                        TCGv_i64), unsigned fpop)
 {
     TCGv_i64 t0, t1, t2;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
+    if (ctx->fp_jit) {
+        return do_fpj_2(ctx, a->frt, a->fra, a->frc, a->rc, fpop);
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
@@ -100,10 +241,20 @@ static bool do_helper_ac(DisasContext *ctx, arg_A_tac *a,
 
 static bool do_round_convert(DisasContext *ctx, arg_X_tb_rc *a,
                              void (*helper)(TCGv_i64, TCGv_env, TCGv_i64),
-                             bool set_fprf)
+                             bool set_fprf, unsigned fpop)
 {
     TCGv_i64 t0, t1;
     REQUIRE_FPU(ctx);
+    if (ctx->fp_jit && fpop) {
+        TCGv_vec vb = fpj_ld(a->rb);
+        TCGv_vec vt = tcg_temp_new_vec(TCG_TYPE_V64);
+        tcg_gen_fpop1_vec(MO_64, vt, vb, fpop);
+        fpj_st(a->rt, vt, set_fprf);
+        if (unlikely(a->rc)) {
+            gen_set_cr1_from_fpscr(ctx);
+        }
+        return true;
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     gen_reset_fpstatus();
@@ -140,7 +291,7 @@ static bool do_helper_bs(DisasContext *ctx, arg_A_tb *a,
 
 static bool trans_FSEL(DisasContext *ctx, arg_A *a)
 {
-    TCGv_i64 t0, t1, t2;
+    TCGv_i64 t0, t1, t2, c0, c1;
 
     REQUIRE_INSNS_FLAGS(ctx, FLOAT_FSEL);
     REQUIRE_FPU(ctx);
@@ -148,12 +299,21 @@ static bool trans_FSEL(DisasContext *ctx, arg_A *a)
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
+    c0 = tcg_temp_new_i64();
+    c1 = tcg_temp_new_i64();
 
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frb);
     get_fpr(t2, a->frc);
 
-    gen_helper_FSEL(t0, t0, t1, t2);
+    /*
+     * FRA >= 0 (+0 to +inf, or -0) and not a NaN selects FRC, as
+     * helper_FSEL does, with integer ops on the encoding.
+     */
+    tcg_gen_setcondi_i64(TCG_COND_LEU, c0, t0, 0x7ff0000000000000ull);
+    tcg_gen_setcondi_i64(TCG_COND_EQ, c1, t0, INT64_MIN);
+    tcg_gen_or_i64(c0, c0, c1);
+    tcg_gen_movcond_i64(TCG_COND_NE, t0, c0, tcg_constant_i64(0), t2, t1);
     set_fpr(a->frt, t0);
     if (a->rc) {
         gen_set_cr1_from_fpscr(ctx);
@@ -162,12 +322,24 @@ static bool trans_FSEL(DisasContext *ctx, arg_A *a)
 }
 
 static bool do_helper_fsqrt(DisasContext *ctx, arg_A_tb *a,
-                            void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64))
+                            void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64),
+                            unsigned fpop)
 {
     TCGv_i64 t0, t1;
 
     REQUIRE_INSNS_FLAGS(ctx, FLOAT_FSQRT);
     REQUIRE_FPU(ctx);
+
+    if (ctx->fp_jit) {
+        TCGv_vec vb = fpj_ld(a->frb);
+        TCGv_vec vt = tcg_temp_new_vec(TCG_TYPE_V64);
+        tcg_gen_fpop1_vec(MO_64, vt, vb, fpop | TCG_FPOP_F_DEFNAN);
+        fpj_st(a->frt, vt, true);
+        if (unlikely(a->rc != 0)) {
+            gen_set_cr1_from_fpscr(ctx);
+        }
+        return true;
+    }
 
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
@@ -183,54 +355,78 @@ static bool do_helper_fsqrt(DisasContext *ctx, arg_A_tb *a,
     return true;
 }
 
-TRANS(FADD, do_helper_ab, gen_helper_FADD);
-TRANS(FADDS, do_helper_ab, gen_helper_FADDS);
-TRANS(FSUB, do_helper_ab, gen_helper_FSUB);
-TRANS(FSUBS, do_helper_ab, gen_helper_FSUBS);
-TRANS(FDIV, do_helper_ab, gen_helper_FDIV);
-TRANS(FDIVS, do_helper_ab, gen_helper_FDIVS);
-TRANS(FMUL, do_helper_ac, gen_helper_FMUL);
-TRANS(FMULS, do_helper_ac, gen_helper_FMULS);
+#define SP_  TCG_FPOP_F_SP
+TRANS(FADD, do_helper_ab, gen_helper_FADD, TCG_FPOP_ADD);
+TRANS(FADDS, do_helper_ab, gen_helper_FADDS, TCG_FPOP_ADD | SP_);
+TRANS(FSUB, do_helper_ab, gen_helper_FSUB, TCG_FPOP_SUB);
+TRANS(FSUBS, do_helper_ab, gen_helper_FSUBS, TCG_FPOP_SUB | SP_);
+TRANS(FDIV, do_helper_ab, gen_helper_FDIV, TCG_FPOP_DIV);
+TRANS(FDIVS, do_helper_ab, gen_helper_FDIVS, TCG_FPOP_DIV | SP_);
+TRANS(FMUL, do_helper_ac, gen_helper_FMUL, TCG_FPOP_MUL);
+TRANS(FMULS, do_helper_ac, gen_helper_FMULS, TCG_FPOP_MUL | SP_);
 
-TRANS(FMADD, do_helper_acb, gen_helper_FMADD);
-TRANS(FMADDS, do_helper_acb, gen_helper_FMADDS);
-TRANS(FMSUB, do_helper_acb, gen_helper_FMSUB);
-TRANS(FMSUBS, do_helper_acb, gen_helper_FMSUBS);
+/* the negated forms negate the rounded result, as the ISA says */
+TRANS(FMADD, do_helper_acb, gen_helper_FMADD, 0);
+TRANS(FMADDS, do_helper_acb, gen_helper_FMADDS, SP_);
+TRANS(FMSUB, do_helper_acb, gen_helper_FMSUB, TCG_FPOP_F_NEG_ADD);
+TRANS(FMSUBS, do_helper_acb, gen_helper_FMSUBS, TCG_FPOP_F_NEG_ADD | SP_);
 
-TRANS(FNMADD, do_helper_acb, gen_helper_FNMADD);
-TRANS(FNMADDS, do_helper_acb, gen_helper_FNMADDS);
-TRANS(FNMSUB, do_helper_acb, gen_helper_FNMSUB);
-TRANS(FNMSUBS, do_helper_acb, gen_helper_FNMSUBS);
+TRANS(FNMADD, do_helper_acb, gen_helper_FNMADD, TCG_FPOP_F_NEG_RES);
+TRANS(FNMADDS, do_helper_acb, gen_helper_FNMADDS, TCG_FPOP_F_NEG_RES | SP_);
+TRANS(FNMSUB, do_helper_acb, gen_helper_FNMSUB,
+      TCG_FPOP_F_NEG_ADD | TCG_FPOP_F_NEG_RES);
+TRANS(FNMSUBS, do_helper_acb, gen_helper_FNMSUBS,
+      TCG_FPOP_F_NEG_ADD | TCG_FPOP_F_NEG_RES | SP_);
 
 TRANS_FLAGS(FLOAT_EXT, FRE, do_helper_bs, gen_helper_FRE);
 TRANS_FLAGS(FLOAT_FRES, FRES, do_helper_bs, gen_helper_FRES);
 TRANS_FLAGS(FLOAT_FRSQRTE, FRSQRTE, do_helper_bs, gen_helper_FRSQRTE);
 TRANS_FLAGS(FLOAT_FRSQRTES, FRSQRTES, do_helper_bs, gen_helper_FRSQRTES);
 
-TRANS(FSQRT, do_helper_fsqrt, gen_helper_FSQRT);
-TRANS(FSQRTS, do_helper_fsqrt, gen_helper_FSQRTS);
+TRANS(FSQRT, do_helper_fsqrt, gen_helper_FSQRT, TCG_FPOP_SQRT);
+TRANS(FSQRTS, do_helper_fsqrt, gen_helper_FSQRTS, TCG_FPOP_SQRT | SP_);
 
 /***                     Floating-Point round & convert                    ***/
-TRANS_FLAGS(FLOAT, FRSP, do_round_convert, gen_helper_FRSP, true);
-TRANS_FLAGS(FLOAT_EXT, FRIN, do_round_convert, gen_helper_FRIN, true);
-TRANS_FLAGS(FLOAT_EXT, FRIZ, do_round_convert, gen_helper_FRIZ, true);
-TRANS_FLAGS(FLOAT_EXT, FRIP, do_round_convert, gen_helper_FRIP, true);
-TRANS_FLAGS(FLOAT_EXT, FRIM, do_round_convert, gen_helper_FRIM, true);
+/* fpop 0: always the helper (frin rounds ties away, which x86 cannot) */
+#define RINT_(m)    (TCG_FPOP_RINT | TCG_FPOP_RMODE(m))
+#define CVTI_(op)   (TCG_FPOP_CVTI_##op | TCG_FPOP_F_PPC_SAT)
+#define CVTIZ_(op)  (CVTI_(op) | TCG_FPOP_F_TRUNC)
+TRANS_FLAGS(FLOAT, FRSP, do_round_convert, gen_helper_FRSP, true,
+            TCG_FPOP_RND_SP);
+TRANS_FLAGS(FLOAT_EXT, FRIN, do_round_convert, gen_helper_FRIN, true, 0);
+TRANS_FLAGS(FLOAT_EXT, FRIZ, do_round_convert, gen_helper_FRIZ, true,
+            RINT_(TCG_FPRND_ZERO));
+TRANS_FLAGS(FLOAT_EXT, FRIP, do_round_convert, gen_helper_FRIP, true,
+            RINT_(TCG_FPRND_UP));
+TRANS_FLAGS(FLOAT_EXT, FRIM, do_round_convert, gen_helper_FRIM, true,
+            RINT_(TCG_FPRND_DOWN));
 
-TRANS_FLAGS(FLOAT, FCTIW, do_round_convert, gen_helper_FCTIW, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCTIWU, do_round_convert, gen_helper_FCTIWU, false);
-TRANS_FLAGS(FLOAT, FCTIWZ, do_round_convert, gen_helper_FCTIWZ, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCTIWUZ, do_round_convert, gen_helper_FCTIWUZ, false);
+TRANS_FLAGS(FLOAT, FCTIW, do_round_convert, gen_helper_FCTIW, false,
+            CVTI_(S32));
+TRANS_FLAGS2(FP_CVT_ISA206, FCTIWU, do_round_convert, gen_helper_FCTIWU, false,
+             CVTI_(U32));
+TRANS_FLAGS(FLOAT, FCTIWZ, do_round_convert, gen_helper_FCTIWZ, false,
+            CVTIZ_(S32));
+TRANS_FLAGS2(FP_CVT_ISA206, FCTIWUZ, do_round_convert, gen_helper_FCTIWUZ,
+             false, CVTIZ_(U32));
 
-TRANS_FLAGS2(FP_CVT_S64, FCTID, do_round_convert, gen_helper_FCTID, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCTIDU, do_round_convert, gen_helper_FCTIDU, false);
-TRANS_FLAGS2(FP_CVT_S64, FCTIDZ, do_round_convert, gen_helper_FCTIDZ, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCTIDUZ, do_round_convert, gen_helper_FCTIDUZ, false);
+TRANS_FLAGS2(FP_CVT_S64, FCTID, do_round_convert, gen_helper_FCTID, false,
+             CVTI_(S));
+TRANS_FLAGS2(FP_CVT_ISA206, FCTIDU, do_round_convert, gen_helper_FCTIDU, false,
+             CVTI_(U));
+TRANS_FLAGS2(FP_CVT_S64, FCTIDZ, do_round_convert, gen_helper_FCTIDZ, false,
+             CVTIZ_(S));
+TRANS_FLAGS2(FP_CVT_ISA206, FCTIDUZ, do_round_convert, gen_helper_FCTIDUZ,
+             false, CVTIZ_(U));
 
-TRANS_FLAGS2(FP_CVT_S64, FCFID, do_round_convert, gen_helper_FCFID, true);
-TRANS_FLAGS2(FP_CVT_ISA206, FCFIDS, do_round_convert, gen_helper_FCFIDS, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCFIDU, do_round_convert, gen_helper_FCFIDU, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCFIDUS, do_round_convert, gen_helper_FCFIDUS, false);
+TRANS_FLAGS2(FP_CVT_S64, FCFID, do_round_convert, gen_helper_FCFID, true,
+             TCG_FPOP_CVT_S);
+TRANS_FLAGS2(FP_CVT_ISA206, FCFIDS, do_round_convert, gen_helper_FCFIDS, false,
+             TCG_FPOP_CVT_S | SP_);
+TRANS_FLAGS2(FP_CVT_ISA206, FCFIDU, do_round_convert, gen_helper_FCFIDU, false,
+             TCG_FPOP_CVT_U);
+TRANS_FLAGS2(FP_CVT_ISA206, FCFIDUS, do_round_convert, gen_helper_FCFIDUS,
+             false, TCG_FPOP_CVT_U | SP_);
 
 static bool trans_FTDIV(DisasContext *ctx, arg_X_bf *a)
 {
@@ -259,12 +455,28 @@ static bool trans_FTSQRT(DisasContext *ctx, arg_X_bf_b *a)
 /***                         Floating-Point compare                        ***/
 static bool do_helper_cmp(DisasContext *ctx, arg_X_bf *a,
                           void (*helper)(TCGv_env, TCGv_i64, TCGv_i64,
-                                         TCGv_i32))
+                                         TCGv_i32), bool ordered)
 {
     TCGv_i32 crf;
     TCGv_i64 t0, t1;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
+    if (ctx->fp_jit) {
+        TCGv_vec va = fpj_ld(a->ra);
+        TCGv_vec vb = fpj_ld(a->rb);
+        TCGv_i32 lazy = tcg_temp_new_i32();
+        TCGv t = tcg_temp_new();
+
+        tcg_gen_fpcmpcc_vec(MO_64, cpu_crf[a->bf], va, vb,
+                            ordered ? TCG_FPOP_F_SIGNAL : 0);
+        /* FPSCR[FPCC] = CR field, the class bit C is left alone */
+        tcg_gen_extu_i32_tl(t, cpu_crf[a->bf]);
+        tcg_gen_deposit_tl(cpu_fpscr, cpu_fpscr, t, FPSCR_FPCC, 4);
+        tcg_gen_ld_i32(lazy, tcg_env, offsetof(CPUPPCState, fprf_lazy));
+        tcg_gen_ori_i32(lazy, lazy, PPC_FPRF_LAZY_FPCC);
+        tcg_gen_st_i32(lazy, tcg_env, offsetof(CPUPPCState, fprf_lazy));
+        return true;
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     gen_reset_fpstatus();
@@ -276,8 +488,8 @@ static bool do_helper_cmp(DisasContext *ctx, arg_X_bf *a,
     return true;
 }
 
-TRANS(FCMPU, do_helper_cmp, gen_helper_FCMPU);
-TRANS(FCMPO, do_helper_cmp, gen_helper_FCMPO);
+TRANS(FCMPU, do_helper_cmp, gen_helper_FCMPU, false);
+TRANS(FCMPO, do_helper_cmp, gen_helper_FCMPO, true);
 
 /***                         Floating-point move                           ***/
 
@@ -389,6 +601,7 @@ static void gen_mcrfs(DisasContext *ctx)
     bfa = crfS(ctx->opcode);
     nibble = 7 - bfa;
     shift = 4 * nibble;
+    gen_helper_fpscr_sync(tcg_env);
     tcg_gen_shri_tl(tmp, cpu_fpscr, shift);
     tcg_gen_trunc_tl_i32(cpu_crf[crfD(ctx->opcode)], tmp);
     tcg_gen_andi_i32(cpu_crf[crfD(ctx->opcode)], cpu_crf[crfD(ctx->opcode)],
@@ -478,6 +691,10 @@ static bool trans_MFFSCRN(DisasContext *ctx, arg_X_tb *a)
     gen_reset_fpstatus();
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_RN, t1, 0x0001);
+    if (ctx->fp_jit) {
+        /* a directed rounding mode needs the helpers (HFLAGS_FP_SOFT) */
+        ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
+    }
     return true;
 }
 
@@ -509,6 +726,9 @@ static bool trans_MFFSCRNI(DisasContext *ctx, arg_X_imm2 *a)
     gen_reset_fpstatus();
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_RN, t1, 0x0001);
+    if (ctx->fp_jit && a->imm) {
+        ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
+    }
     return true;
 }
 
@@ -569,6 +789,10 @@ static void gen_mtfsb1(DisasContext *ctx)
     /* XXX: we pretend we can only do IEEE floating-point computations */
     if (likely(crb != FPSCR_FEX && crb != FPSCR_VX && crb != FPSCR_NI)) {
         gen_helper_fpscr_setbit(tcg_env, tcg_constant_i32(crb));
+        if (ctx->fp_jit && (FP_SOFT_MASK & (1ull << crb))) {
+            /* FP exception or directed rounding: next TBs use the helpers */
+            ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
+        }
     }
     if (unlikely(Rc(ctx->opcode) != 0)) {
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
@@ -606,6 +830,10 @@ static void gen_mtfsf(DisasContext *ctx)
     t1 = tcg_temp_new_i64();
     get_fpr(t1, rB(ctx->opcode));
     gen_helper_store_fpscr(tcg_env, t1, t0);
+    if (ctx->fp_jit && (l || (flm << (w * 8)) & 3)) {
+        /* nibbles 0-1 hold RN and the enables: the TB flags may change */
+        ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
+    }
     if (unlikely(Rc(ctx->opcode) != 0)) {
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
         tcg_gen_shri_i32(cpu_crf[1], cpu_crf[1], FPSCR_OX);
@@ -635,6 +863,10 @@ static void gen_mtfsfi(DisasContext *ctx)
     t0 = tcg_constant_i64(((uint64_t)FPIMM(ctx->opcode)) << (4 * sh));
     t1 = tcg_constant_i32(1 << sh);
     gen_helper_store_fpscr(tcg_env, t0, t1);
+    if (ctx->fp_jit
+        && ((((uint64_t)FPIMM(ctx->opcode)) << (4 * sh)) & FP_SOFT_MASK)) {
+        ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
+    }
     if (unlikely(Rc(ctx->opcode) != 0)) {
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
         tcg_gen_shri_i32(cpu_crf[1], cpu_crf[1], FPSCR_OX);
@@ -647,7 +879,7 @@ static void gen_qemu_ld32fs(DisasContext *ctx, TCGv_i64 dest, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
     tcg_gen_qemu_ld_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
-    gen_helper_todouble(dest, tmp);
+    gen_todouble(dest, tmp);
 }
 
 /* lfdepx (external PID lfdx) */
@@ -789,7 +1021,7 @@ static void glue(gen_, name##x)(DisasContext *ctx)                            \
 static void gen_qemu_st32fs(DisasContext *ctx, TCGv_i64 src, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
-    gen_helper_tosingle(tmp, src);
+    gen_tosingle(tmp, src);
     tcg_gen_qemu_st_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
 }
 

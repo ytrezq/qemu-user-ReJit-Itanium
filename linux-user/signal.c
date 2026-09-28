@@ -1052,6 +1052,9 @@ static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
         cpu_exit(thread_cpu);
         return;
     }
+#ifdef HAVE_HOST_SIGNAL_RESTORE_FPENV
+    host_signal_restore_fpenv(uc);
+#endif
 
     /*
      * Non-spoofed SIGSEGV and SIGBUS are synchronous, and need special

@@ -3507,6 +3507,8 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
     }
 }
 
+#include "tcg-target-fpop.c.inc"
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -3594,6 +3596,10 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     TCGType type = vecl + TCG_TYPE_V64;
     int insn, sub;
     TCGArg a0, a1, a2, a3;
+
+    if (tcg_out_fpop_vec(s, opc, type, vece, args)) {
+        return;
+    }
 
     a0 = args[0];
     a1 = args[1];
@@ -3902,6 +3908,17 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I3(x, x, x, x);
     case INDEX_op_cmpsel_vec:
         return C_O1_I4(x, x, x, xO, x);
+
+    /* The result is written before the last use of the inputs. */
+    case INDEX_op_fpop1_vec:
+        return C_N1_I1(x, x);
+    case INDEX_op_fpop2_vec:
+        return C_N1_I2(x, x, x);
+    case INDEX_op_fpop3_vec:
+    case INDEX_op_perm2b_vec:
+        return C_N1_I3(x, x, x, x);
+    case INDEX_op_fpcmpcc_vec:
+        return C_O1_I2(r, x, x);
 
     default:
         return C_NotImplemented;
