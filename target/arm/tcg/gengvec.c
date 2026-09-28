@@ -1867,6 +1867,72 @@ void gen_gvec_uaba(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
     tcg_gen_gvec_3(rd_ofs, rn_ofs, rm_ofs, opr_sz, max_sz, &ops[vece]);
 }
 
+/*
+ * Pairwise operations (ADDP, [SU]MAXP, [SU]MINP, and the A32 VPADD,
+ * VPMAX, VPMIN): the result is op(even, odd) elements of the
+ * concatenation n:m (of the low halves for 64-bit vectors).  Where the
+ * host has a two-table byte permute, gather the even and the odd
+ * elements with it and apply op once, instead of calling a helper that
+ * loops over the elements (glibc's aarch64 strlen, strchr and memchr
+ * reduce their compare masks with UMAXP).
+ */
+typedef void PairwiseVecOp(unsigned, TCGv_vec, TCGv_vec, TCGv_vec);
+
+static bool gen_gvec_pairwise_inline(unsigned vece, uint32_t rd_ofs,
+                                     uint32_t rn_ofs, uint32_t rm_ofs,
+                                     uint32_t opr_sz, uint32_t max_sz,
+                                     PairwiseVecOp *op, TCGOpcode opc)
+{
+    /* [q][odd][vece] byte indexes into n:m, n = bytes 0-15, m = 16-31 */
+    static uint8_t idx[2][2][4][16] QEMU_ALIGNED(16);
+    static bool idx_done;
+    bool q = opr_sz == 16;
+    TCGv_vec n, m, t, e, o;
+
+    if ((opr_sz != 8 && opr_sz != 16) || (!q && vece == MO_64)
+        || !tcg_can_emit_perm2b(TCG_TYPE_V128)
+        || !tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece)) {
+        return false;
+    }
+    if (!idx_done) {
+        for (int qq = 0; qq < 2; qq++) {
+            for (int odd = 0; odd < 2; odd++) {
+                for (int es = 0; es < 4; es++) {
+                    int ebytes = 1 << es;
+                    int nelem = (qq ? 16 : 8) / ebytes;
+                    for (int i = 0; i < 16; i++) {
+                        int k = i / ebytes, b = i % ebytes;
+                        /* source element 2k + odd of n:m (low halves) */
+                        int src = 2 * k + odd;
+                        int reg = src >= nelem, se = src % nelem;
+                        idx[qq][odd][es][i] = reg * 16 + se * ebytes + b;
+                    }
+                }
+            }
+        }
+        idx_done = true;
+    }
+
+    n = tcg_temp_new_vec(TCG_TYPE_V128);
+    m = tcg_temp_new_vec(TCG_TYPE_V128);
+    t = tcg_temp_new_vec(TCG_TYPE_V128);
+    e = tcg_temp_new_vec(TCG_TYPE_V128);
+    o = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(n, tcg_env, rn_ofs);
+    tcg_gen_ld_vec(m, tcg_env, rm_ofs);
+    tcg_gen_ld_vec(t, tcg_constant_ptr(idx[q][0][vece]), 0);
+    tcg_gen_perm2b_vec(e, n, m, t);
+    tcg_gen_ld_vec(t, tcg_constant_ptr(idx[q][1][vece]), 0);
+    tcg_gen_perm2b_vec(o, n, m, t);
+    op(vece, e, e, o);
+    tcg_gen_stl_vec(e, tcg_env, rd_ofs, q ? TCG_TYPE_V128 : TCG_TYPE_V64);
+    if (max_sz > opr_sz) {
+        tcg_gen_gvec_dup_imm(MO_64, rd_ofs + opr_sz, max_sz - opr_sz,
+                             max_sz - opr_sz, 0);
+    }
+    return true;
+}
+
 void gen_gvec_addp(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
                    uint32_t rm_ofs, uint32_t opr_sz, uint32_t max_sz)
 {
@@ -1876,6 +1942,10 @@ void gen_gvec_addp(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_gvec_addp_s,
         gen_helper_gvec_addp_d,
     };
+    if (gen_gvec_pairwise_inline(vece, rd_ofs, rn_ofs, rm_ofs, opr_sz,
+                                 max_sz, tcg_gen_add_vec, INDEX_op_add_vec)) {
+        return;
+    }
     tcg_gen_gvec_3_ool(rd_ofs, rn_ofs, rm_ofs, opr_sz, max_sz, 0, fns[vece]);
 }
 
@@ -1888,6 +1958,10 @@ void gen_gvec_smaxp(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_gvec_smaxp_s,
     };
     tcg_debug_assert(vece <= MO_32);
+    if (gen_gvec_pairwise_inline(vece, rd_ofs, rn_ofs, rm_ofs, opr_sz,
+                                 max_sz, tcg_gen_smax_vec, INDEX_op_smax_vec)) {
+        return;
+    }
     tcg_gen_gvec_3_ool(rd_ofs, rn_ofs, rm_ofs, opr_sz, max_sz, 0, fns[vece]);
 }
 
@@ -1900,6 +1974,10 @@ void gen_gvec_sminp(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_gvec_sminp_s,
     };
     tcg_debug_assert(vece <= MO_32);
+    if (gen_gvec_pairwise_inline(vece, rd_ofs, rn_ofs, rm_ofs, opr_sz,
+                                 max_sz, tcg_gen_smin_vec, INDEX_op_smin_vec)) {
+        return;
+    }
     tcg_gen_gvec_3_ool(rd_ofs, rn_ofs, rm_ofs, opr_sz, max_sz, 0, fns[vece]);
 }
 
@@ -1912,6 +1990,10 @@ void gen_gvec_umaxp(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_gvec_umaxp_s,
     };
     tcg_debug_assert(vece <= MO_32);
+    if (gen_gvec_pairwise_inline(vece, rd_ofs, rn_ofs, rm_ofs, opr_sz,
+                                 max_sz, tcg_gen_umax_vec, INDEX_op_umax_vec)) {
+        return;
+    }
     tcg_gen_gvec_3_ool(rd_ofs, rn_ofs, rm_ofs, opr_sz, max_sz, 0, fns[vece]);
 }
 
@@ -1924,6 +2006,10 @@ void gen_gvec_uminp(unsigned vece, uint32_t rd_ofs, uint32_t rn_ofs,
         gen_helper_gvec_uminp_s,
     };
     tcg_debug_assert(vece <= MO_32);
+    if (gen_gvec_pairwise_inline(vece, rd_ofs, rn_ofs, rm_ofs, opr_sz,
+                                 max_sz, tcg_gen_umin_vec, INDEX_op_umin_vec)) {
+        return;
+    }
     tcg_gen_gvec_3_ool(rd_ofs, rn_ofs, rm_ofs, opr_sz, max_sz, 0, fns[vece]);
 }
 
