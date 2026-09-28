@@ -1984,6 +1984,13 @@ void tcg_func_start(TCGContext *s)
     QTAILQ_INIT(&s->ops);
     QTAILQ_INIT(&s->free_ops);
     s->emit_before_op = NULL;
+#ifdef CONFIG_DEBUG_TCG
+    /*
+     * A translation restarted by tcg_raise_tb_overflow() (too many temps)
+     * may have left the list of a gvec expansion.
+     */
+    s->vecop_list = NULL;
+#endif
     QSIMPLEQ_INIT(&s->labels);
 
     tcg_debug_assert(s->addr_type <= TCG_TYPE_REG);

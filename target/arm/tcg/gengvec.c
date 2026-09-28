@@ -1927,8 +1927,14 @@ static bool gen_gvec_pairwise_inline(unsigned vece, uint32_t rd_ofs,
     op(vece, e, e, o);
     tcg_gen_stl_vec(e, tcg_env, rd_ofs, q ? TCG_TYPE_V128 : TCG_TYPE_V64);
     if (max_sz > opr_sz) {
-        tcg_gen_gvec_dup_imm(MO_64, rd_ofs + opr_sz, max_sz - opr_sz,
-                             max_sz - opr_sz, 0);
+        /* clear the tail, in pieces that gvec accepts (multiples of 16) */
+        if (!q) {
+            tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, rd_ofs + 8);
+        }
+        if (max_sz > 16) {
+            tcg_gen_gvec_dup_imm(MO_64, rd_ofs + 16, max_sz - 16,
+                                 max_sz - 16, 0);
+        }
     }
     return true;
 }
