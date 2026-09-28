@@ -525,6 +525,8 @@ void tcg_gen_ldm_vec(TCGv_vec r, TCGv_ptr ptr, TCGv_i64 mask);
 void tcg_gen_stm_vec(TCGv_vec v, TCGv_ptr ptr, TCGv_i64 mask);
 void tcg_gen_st32_vec(TCGv_vec r, TCGv_ptr b, TCGArg o);
 void tcg_gen_ld32_vec(TCGv_vec r, TCGv_ptr b, TCGArg o);
+void tcg_gen_crypto_vec(unsigned op, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                        TCGv_vec c);
 
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);

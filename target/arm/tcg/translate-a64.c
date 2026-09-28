@@ -30,6 +30,7 @@
 #include "semihosting/semihost.h"
 #include "cpregs.h"
 #include "qemu/xxhash.h"
+#include "tcg/tcg-crypto.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
 #endif
@@ -5812,6 +5813,78 @@ TRANS(ZIP1, do_simd_permute, a, permute_load_zip, 0)
 TRANS(ZIP2, do_simd_permute, a, permute_load_zip, 1)
 
 /*
+ * FP instructions in host FP code (TCG fpops, include/tcg/tcg-fpop.h),
+ * when FPCR is in its default state (dc->fpj, TB flag FPSOFT clear):
+ * operands go straight from the vector registers in env to host vector
+ * registers and back, TCG_TYPE_V64 for scalars (lane 0) and TCG_TYPE_V128
+ * for vectors, and the exception flags accumulate in the host status
+ * register until FPSR is read (vfp_get_fpsr_from_host).  NaNs follow the
+ * FPProcessNaNs rules (ARM_FPJ_NAN); FPNeg and FPAbs, which also flip or
+ * clear the sign of NaNs, are plain sign bit operations.
+ */
+enum {
+    FPJ_NEG_RES = 1,    /* FPNeg of the result */
+    FPJ_ABS_RES = 2,    /* FPAbs of the result */
+    FPJ_ABS_IN = 4,     /* FPAbs of the operands (FACGE, FACGT) */
+    FPJ_NEG_N = 8,      /* FPNeg of the first operand (FMLS) */
+    FPJ_SWAP = 16,      /* operands swapped (compares with zero) */
+};
+
+static bool fpj_ok(DisasContext *s, MemOp esz, TCGType type, unsigned fpop)
+{
+    return s->fpj && (esz == MO_32 || esz == MO_64)
+           && tcg_can_emit_fpop(fpop, type, esz);
+}
+
+static TCGv_vec fpj_ld(DisasContext *s, TCGType type, int reg)
+{
+    TCGv_vec v = tcg_temp_new_vec(type);
+
+    tcg_gen_ld_vec(v, tcg_env, vec_full_reg_offset(s, reg));
+    return v;
+}
+
+/* Write a scalar (V64: the other 64 bits of Qn cleared) or a vector */
+static void fpj_st(DisasContext *s, TCGType type, int reg, TCGv_vec v)
+{
+    tcg_gen_st_vec(v, tcg_env, vec_full_reg_offset(s, reg));
+    clear_vec_high(s, type == TCG_TYPE_V128, reg);
+}
+
+/* d = FPNeg(a) or FPAbs(a), elementwise (scalars: lane 0 only) */
+static void fpj_sign(TCGType type, MemOp esz, TCGv_vec d, TCGv_vec a,
+                     bool abs)
+{
+    uint64_t sign = esz == MO_64 ? INT64_MIN : 0x80000000u;
+    MemOp ve = type == TCG_TYPE_V64 ? MO_64 : esz;
+
+    if (abs) {
+        tcg_gen_and_vec(ve, d, a, tcg_constant_vec(type, ve, sign - 1));
+    } else {
+        tcg_gen_xor_vec(ve, d, a, tcg_constant_vec(type, ve, sign));
+    }
+}
+
+/* d = fpop(n, m) with the FPJ_* adjustments */
+static void fpj_op2(TCGType type, MemOp esz, TCGv_vec d, TCGv_vec n,
+                    TCGv_vec m, unsigned fpop, int adj)
+{
+    if (adj & FPJ_ABS_IN) {
+        fpj_sign(type, esz, n, n, true);
+        fpj_sign(type, esz, m, m, true);
+    }
+    if (adj & FPJ_SWAP) {
+        TCGv_vec t = n;
+        n = m;
+        m = t;
+    }
+    tcg_gen_fpop2_vec(esz, d, n, m, fpop);
+    if (adj & (FPJ_NEG_RES | FPJ_ABS_RES)) {
+        fpj_sign(type, esz, d, d, adj & FPJ_ABS_RES);
+    }
+}
+
+/*
  * Cryptographic AES, SHA, SHA512
  */
 
@@ -5825,13 +5898,51 @@ TRANS_FEAT(SHA1P, aa64_sha1, do_gvec_op3_ool, a, 0, gen_helper_crypto_sha1p)
 TRANS_FEAT(SHA1M, aa64_sha1, do_gvec_op3_ool, a, 0, gen_helper_crypto_sha1m)
 TRANS_FEAT(SHA1SU0, aa64_sha1, do_gvec_op3_ool, a, 0, gen_helper_crypto_sha1su0)
 
-TRANS_FEAT(SHA256H, aa64_sha256, do_gvec_op3_ool, a, 0, gen_helper_crypto_sha256h)
-TRANS_FEAT(SHA256H2, aa64_sha256, do_gvec_op3_ool, a, 0, gen_helper_crypto_sha256h2)
-TRANS_FEAT(SHA256SU1, aa64_sha256, do_gvec_op3_ool, a, 0, gen_helper_crypto_sha256su1)
+/*
+ * SHA-256 steps in host code where the host has instructions for them
+ * (tcg-crypto.h): Vd = op(Vd, Vn, Vm).
+ */
+static bool do_crypto_j(DisasContext *s, arg_qrrr_e *a, TCGCryptoOp op,
+                        gen_helper_gvec_3 *fn)
+{
+    TCGv_vec d, n, m;
+
+    if (!tcg_can_emit_crypto(op)) {
+        return do_gvec_op3_ool(s, a, 0, fn);
+    }
+    if (fp_access_check(s)) {
+        d = fpj_ld(s, TCG_TYPE_V128, a->rd);
+        n = fpj_ld(s, TCG_TYPE_V128, a->rn);
+        m = fpj_ld(s, TCG_TYPE_V128, a->rm);
+        tcg_gen_crypto_vec(op, d, d, n, m);
+        fpj_st(s, TCG_TYPE_V128, a->rd, d);
+    }
+    return true;
+}
+
+static bool trans_SHA256SU0(DisasContext *s, arg_qrr_e *a)
+{
+    arg_qrrr_e a3 = { .rd = a->rd, .rn = a->rn, .rm = a->rn,
+                      .q = a->q, .esz = a->esz };
+
+    if (!dc_isar_feature(aa64_sha256, s)) {
+        return false;
+    }
+    if (!tcg_can_emit_crypto(TCG_CRYPTO_SHA256SU0)) {
+        return do_gvec_op2_ool(s, a, 0, gen_helper_crypto_sha256su0);
+    }
+    return do_crypto_j(s, &a3, TCG_CRYPTO_SHA256SU0, NULL);
+}
+
+TRANS_FEAT(SHA256H, aa64_sha256, do_crypto_j, a, TCG_CRYPTO_SHA256H,
+           gen_helper_crypto_sha256h)
+TRANS_FEAT(SHA256H2, aa64_sha256, do_crypto_j, a, TCG_CRYPTO_SHA256H2,
+           gen_helper_crypto_sha256h2)
+TRANS_FEAT(SHA256SU1, aa64_sha256, do_crypto_j, a, TCG_CRYPTO_SHA256SU1,
+           gen_helper_crypto_sha256su1)
 
 TRANS_FEAT(SHA1H, aa64_sha1, do_gvec_op2_ool, a, 0, gen_helper_crypto_sha1h)
 TRANS_FEAT(SHA1SU1, aa64_sha1, do_gvec_op2_ool, a, 0, gen_helper_crypto_sha1su1)
-TRANS_FEAT(SHA256SU0, aa64_sha256, do_gvec_op2_ool, a, 0, gen_helper_crypto_sha256su0)
 
 TRANS_FEAT(SHA512H, aa64_sha512, do_gvec_op3_ool, a, 0, gen_helper_crypto_sha512h)
 TRANS_FEAT(SHA512H2, aa64_sha512, do_gvec_op3_ool, a, 0, gen_helper_crypto_sha512h2)
@@ -6042,78 +6153,6 @@ static bool trans_INS_element(DisasContext *s, arg_INS_element *a)
 /*
  * Advanced SIMD three same
  */
-
-/*
- * FP instructions in host FP code (TCG fpops, include/tcg/tcg-fpop.h),
- * when FPCR is in its default state (dc->fpj, TB flag FPSOFT clear):
- * operands go straight from the vector registers in env to host vector
- * registers and back, TCG_TYPE_V64 for scalars (lane 0) and TCG_TYPE_V128
- * for vectors, and the exception flags accumulate in the host status
- * register until FPSR is read (vfp_get_fpsr_from_host).  NaNs follow the
- * FPProcessNaNs rules (ARM_FPJ_NAN); FPNeg and FPAbs, which also flip or
- * clear the sign of NaNs, are plain sign bit operations.
- */
-enum {
-    FPJ_NEG_RES = 1,    /* FPNeg of the result */
-    FPJ_ABS_RES = 2,    /* FPAbs of the result */
-    FPJ_ABS_IN = 4,     /* FPAbs of the operands (FACGE, FACGT) */
-    FPJ_NEG_N = 8,      /* FPNeg of the first operand (FMLS) */
-    FPJ_SWAP = 16,      /* operands swapped (compares with zero) */
-};
-
-static bool fpj_ok(DisasContext *s, MemOp esz, TCGType type, unsigned fpop)
-{
-    return s->fpj && (esz == MO_32 || esz == MO_64)
-           && tcg_can_emit_fpop(fpop, type, esz);
-}
-
-static TCGv_vec fpj_ld(DisasContext *s, TCGType type, int reg)
-{
-    TCGv_vec v = tcg_temp_new_vec(type);
-
-    tcg_gen_ld_vec(v, tcg_env, vec_full_reg_offset(s, reg));
-    return v;
-}
-
-/* Write a scalar (V64: the other 64 bits of Qn cleared) or a vector */
-static void fpj_st(DisasContext *s, TCGType type, int reg, TCGv_vec v)
-{
-    tcg_gen_st_vec(v, tcg_env, vec_full_reg_offset(s, reg));
-    clear_vec_high(s, type == TCG_TYPE_V128, reg);
-}
-
-/* d = FPNeg(a) or FPAbs(a), elementwise (scalars: lane 0 only) */
-static void fpj_sign(TCGType type, MemOp esz, TCGv_vec d, TCGv_vec a,
-                     bool abs)
-{
-    uint64_t sign = esz == MO_64 ? INT64_MIN : 0x80000000u;
-    MemOp ve = type == TCG_TYPE_V64 ? MO_64 : esz;
-
-    if (abs) {
-        tcg_gen_and_vec(ve, d, a, tcg_constant_vec(type, ve, sign - 1));
-    } else {
-        tcg_gen_xor_vec(ve, d, a, tcg_constant_vec(type, ve, sign));
-    }
-}
-
-/* d = fpop(n, m) with the FPJ_* adjustments */
-static void fpj_op2(TCGType type, MemOp esz, TCGv_vec d, TCGv_vec n,
-                    TCGv_vec m, unsigned fpop, int adj)
-{
-    if (adj & FPJ_ABS_IN) {
-        fpj_sign(type, esz, n, n, true);
-        fpj_sign(type, esz, m, m, true);
-    }
-    if (adj & FPJ_SWAP) {
-        TCGv_vec t = n;
-        n = m;
-        m = t;
-    }
-    tcg_gen_fpop2_vec(esz, d, n, m, fpop);
-    if (adj & (FPJ_NEG_RES | FPJ_ABS_RES)) {
-        fpj_sign(type, esz, d, d, adj & FPJ_ABS_RES);
-    }
-}
 
 typedef struct FPScalar {
     void (*gen_h)(TCGv_i32, TCGv_i32, TCGv_i32, TCGv_ptr);

@@ -48,6 +48,9 @@
 #ifndef TCG_TARGET_HAS_fpop_vec
 #define TCG_TARGET_HAS_fpop_vec         0
 #endif
+#ifndef TCG_TARGET_HAS_crypto_vec
+#define TCG_TARGET_HAS_crypto_vec 0
+#endif
 #ifndef TCG_TARGET_HAS_perm2b_vec
 #define TCG_TARGET_HAS_perm2b_vec       0
 #endif

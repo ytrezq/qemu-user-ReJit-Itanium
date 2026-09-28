@@ -12,6 +12,7 @@
  */
 
 #include "tcg/tcg-fpop.h"
+#include "tcg/tcg-crypto.h"
 
 /* Hardware xmm numbers: TCG vector registers are xmm0-15. */
 #define FPX(r)          ((r) - TCG_REG_XMM0)
@@ -1181,6 +1182,93 @@ static bool tcg_target_can_emit_fpop(unsigned fpop, TCGType type,
     }
 }
 
+/*
+ * crypto_vec (tcg-crypto.h) with SHA-NI.  Its instructions have only a
+ * legacy SSE encoding, which reaches xmm0-15, and SHA256RNDS2 takes its
+ * third operand in xmm0: the operands are copied to xmm16-19, xmm0-2 are
+ * saved in xmm20-22 while the SHA instructions use them, and the result
+ * is built in xmm23 (EVEX moves reach all of them; the register
+ * allocator only knows xmm0-15).
+ */
+#define FPO_SHUFPS      (0xc6 | P_EXT)
+#define FPO_PSHUFD      (0x70 | P_EXT | P_DATA16)
+#define FPO_PALIGNR     (0x0f | P_EXT3A | P_DATA16)
+#define FPO_PADDD       (0xfe | P_EXT | P_DATA16)
+
+/* legacy 0f 38 op xmm(r), xmm(rm), both in xmm0-7 */
+static void fpo_sha(TCGContext *s, uint8_t op, int r, int rm)
+{
+    tcg_debug_assert(r < 8 && rm < 8);
+    tcg_out8(s, 0x0f);
+    tcg_out8(s, 0x38);
+    tcg_out8(s, op);
+    tcg_out8(s, 0xc0 | (r << 3) | rm);
+}
+
+#define FPO_SHA256RNDS2 0xcb
+#define FPO_SHA256MSG1  0xcc
+#define FPO_SHA256MSG2  0xcd
+
+static void tcg_out_crypto(TCGContext *s, int d, int a, int b, int c,
+                           unsigned op)
+{
+    const int res = 23;
+
+    fpo_rrr(s, FPO_MOVDQA64, 17, 0, a, 0, false);
+    fpo_rrr(s, FPO_MOVDQA64, 18, 0, b, 0, false);
+    fpo_rrr(s, FPO_MOVDQA64, 19, 0, c, 0, false);
+    for (int i = 0; i < 3; i++) {
+        fpo_rrr(s, FPO_MOVDQA64, 20 + i, 0, i, 0, false);
+    }
+
+    switch (op) {
+    case TCG_CRYPTO_SHA256H:
+    case TCG_CRYPTO_SHA256H2:
+        {
+            /*
+             * Arm keeps a in lane 0 of abcd and e in lane 0 of efgh; x86
+             * works on ABEF = (F, E, B, A) and CDGH = (H, G, D, C), lane 0
+             * first, two rounds at a time; after two rounds, CDGH is the
+             * previous ABEF.
+             */
+            bool h2 = op == TCG_CRYPTO_SHA256H2;
+            int x = h2 ? 18 : 17, y = h2 ? 17 : 18;
+
+            fpo_rrr(s, FPO_MOVDQA64, 0, 0, 19, 0, false);   /* WK0, WK1 */
+            fpo_rrri(s, FPO_SHUFPS, 1, y, x, 0, false, 0x11); /* ABEF */
+            fpo_rrri(s, FPO_SHUFPS, 2, y, x, 0, false, 0xbb); /* CDGH */
+            fpo_sha(s, FPO_SHA256RNDS2, 2, 1);              /* ABEF2 */
+            fpo_rrri(s, FPO_PSHUFD, 0, 0, 19, 0, false, 0x0e); /* WK2, WK3 */
+            fpo_sha(s, FPO_SHA256RNDS2, 1, 2);              /* ABEF4 */
+            /* abcd = (A4, B4, A2, B2), efgh = (E4, F4, E2, F2) */
+            fpo_rrri(s, FPO_SHUFPS, res, 1, 2, 0, false, h2 ? 0x11 : 0xbb);
+        }
+        break;
+    case TCG_CRYPTO_SHA256SU0:
+        /* SHA256MSG1 is SHA256SU0 */
+        fpo_rrr(s, FPO_MOVDQA64, 1, 0, 17, 0, false);
+        fpo_rrr(s, FPO_MOVDQA64, 2, 0, 18, 0, false);
+        fpo_sha(s, FPO_SHA256MSG1, 1, 2);
+        fpo_rrr(s, FPO_MOVDQA64, res, 0, 1, 0, false);
+        break;
+    case TCG_CRYPTO_SHA256SU1:
+        /* SHA256MSG2(a + (b1, b2, b3, c0), c) */
+        fpo_rrri(s, FPO_PALIGNR, 1, 19, 18, 0, false, 4);
+        fpo_rrr(s, FPO_PADDD, 1, 1, 17, 0, false);
+        fpo_rrr(s, FPO_MOVDQA64, 2, 0, 19, 0, false);
+        fpo_sha(s, FPO_SHA256MSG2, 1, 2);
+        fpo_rrr(s, FPO_MOVDQA64, res, 0, 1, 0, false);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    for (int i = 0; i < 3; i++) {
+        fpo_rrr(s, FPO_MOVDQA64, i, 0, 20 + i, 0, false);
+    }
+    fpo_rrr(s, FPO_MOVDQA64, d, 0, res, 0, false);
+}
+
 /* Is the result of a scalar (V64) op a binary32 or int32 element? */
 static bool fpo_res32(unsigned vece, unsigned fpop)
 {
@@ -1234,6 +1322,10 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
         /* vmovdqu8 d{k1}{z}, [ptr]: masked-off bytes do not fault */
         tcg_out_vex_modrm(s, FPO_KMOVW_KR, FPK1, 0, args[2]);
         fpo_rm_base(s, FPO_MOVDQU8_LD, FPX(args[0]), args[1], FPK1, true);
+        return true;
+    case INDEX_op_crypto_vec:
+        tcg_out_crypto(s, FPX(args[0]), FPX(args[1]), FPX(args[2]),
+                       FPX(args[3]), args[4]);
         return true;
     case INDEX_op_ld32_vec:
         /* vmovd x, [base + ofs] */

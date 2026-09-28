@@ -3942,6 +3942,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_N1_I2(x, x, x);
     case INDEX_op_fpop3_vec:
     case INDEX_op_perm2b_vec:
+    case INDEX_op_crypto_vec:
         return C_N1_I3(x, x, x, x);
     case INDEX_op_fpcmpcc_vec:
         return C_O1_I2(r, x, x);

@@ -30,6 +30,7 @@
 #define CPUINFO_GFNI            (1u << 20)
 #define CPUINFO_AVX512VBMI      (1u << 21)
 #define CPUINFO_AVX512BITALG    (1u << 22)
+#define CPUINFO_SHA             (1u << 23)
 
 /* Initialized with a constructor. */
 extern unsigned cpuinfo;

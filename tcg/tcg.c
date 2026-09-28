@@ -2476,6 +2476,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_fpop_vec;
     case INDEX_op_perm2b_vec:
         return has_type && TCG_TARGET_HAS_perm2b_vec;
+    case INDEX_op_crypto_vec:
+        return has_type && TCG_TARGET_HAS_crypto_vec;
     case INDEX_op_ldm_vec:
     case INDEX_op_stm_vec:
         return has_type && TCG_TARGET_HAS_ldstm_vec;
@@ -2519,6 +2521,11 @@ bool tcg_can_emit_fpop(unsigned fpop, TCGType type, unsigned vece)
 #else
     return false;
 #endif
+}
+
+bool tcg_can_emit_crypto(unsigned op)
+{
+    return tcg_op_supported(INDEX_op_crypto_vec, TCG_TYPE_V128, 0);
 }
 
 bool tcg_can_emit_perm2b(TCGType type)

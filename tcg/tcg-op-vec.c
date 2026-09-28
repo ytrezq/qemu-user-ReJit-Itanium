@@ -275,6 +275,25 @@ void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr b, TCGArg o)
     vec_gen_ldst(INDEX_op_st_vec, r, b, o);
 }
 
+/* r = hash step @op (TCGCryptoOp) of a, b, c; see tcg_can_emit_crypto() */
+void tcg_gen_crypto_vec(unsigned op, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                        TCGv_vec c)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGOp *o;
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcg_can_emit_crypto(op));
+    o = tcg_emit_op(INDEX_op_crypto_vec, 5);
+    TCGOP_TYPE(o) = TCG_TYPE_V128;
+    TCGOP_VECE(o) = MO_32;
+    o->args[0] = temp_arg(rt);
+    o->args[1] = tcgv_vec_arg(a);
+    o->args[2] = tcgv_vec_arg(b);
+    o->args[3] = tcgv_vec_arg(c);
+    o->args[4] = op;
+}
+
 /* Load r with a 32-bit element, the others zero; see TCG_TARGET_HAS_fpop_vec */
 void tcg_gen_ld32_vec(TCGv_vec r, TCGv_ptr b, TCGArg o)
 {
