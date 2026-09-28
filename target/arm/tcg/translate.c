@@ -6576,6 +6576,10 @@ static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
         dc->vfp_enabled = EX_TBFLAG_A32(tb_flags, VFPEN);
         dc->vec_len = EX_TBFLAG_A32(tb_flags, VECLEN);
         dc->vec_stride = EX_TBFLAG_A32(tb_flags, VECSTRIDE);
+        /* no VFP short vectors, FPSCR in its default state */
+        dc->fpj = !EX_TBFLAG_A32(tb_flags, FPSOFT)
+                  && dc->vec_len == 0 && dc->vec_stride == 0
+                  && arm_fpj_enabled();
         dc->sme_trap_nonstreaming =
             EX_TBFLAG_A32(tb_flags, SME_TRAP_NONSTREAMING);
     }

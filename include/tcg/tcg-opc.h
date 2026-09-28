@@ -197,7 +197,8 @@ DEF(perm2b_vec, 1, 3, 0, TCG_OPF_VECTOR)
  */
 DEF(ldm_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_SIDE_EFFECTS)
 DEF(stm_vec, 0, 3, 0, TCG_OPF_VECTOR | TCG_OPF_SIDE_EFFECTS)
-/* store the low 32-bit element of a vector (scalar FP results) */
+/* load/store the low 32-bit element of a vector (scalar FP), load zeroing */
+DEF(ld32_vec, 1, 1, 1, TCG_OPF_VECTOR)
 DEF(st32_vec, 0, 2, 1, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)

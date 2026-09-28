@@ -1235,6 +1235,11 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
         tcg_out_vex_modrm(s, FPO_KMOVW_KR, FPK1, 0, args[2]);
         fpo_rm_base(s, FPO_MOVDQU8_LD, FPX(args[0]), args[1], FPK1, true);
         return true;
+    case INDEX_op_ld32_vec:
+        /* vmovd x, [base + ofs] */
+        tcg_out_vex_modrm_offset(s, OPC_MOVD_VyEy, args[0], 0, args[1],
+                                 args[2]);
+        return true;
     case INDEX_op_st32_vec:
         /* vmovd [base + ofs], x */
         tcg_out_vex_modrm_offset(s, OPC_MOVD_EyVy, args[0], 0, args[1],
