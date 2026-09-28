@@ -1311,6 +1311,20 @@ static void gen_goto_ptr(void)
     tcg_gen_lookup_and_goto_ptr();
 }
 
+bool arm_fpj_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *e = getenv("QEMU_ARM_FPJIT");
+
+        enabled = !(e && e[0] == '0')
+                  && tcg_can_emit_fpop(TCG_FPOP_ADD, TCG_TYPE_V128, MO_64)
+                  && tcg_can_emit_fpop(TCG_FPOP_ADD, TCG_TYPE_V64, MO_32);
+    }
+    return enabled;
+}
+
 /*
  * End of a TB with an indirect branch (DISAS_JUMP): the branch changed
  * the pc and maybe the Thumb state, and left the IT state in env; the

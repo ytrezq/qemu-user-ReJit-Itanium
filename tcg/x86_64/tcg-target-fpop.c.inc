@@ -298,6 +298,26 @@ static void fpo_patch8(TCGContext *s, uint8_t *p)
     *p = d;
 }
 
+/* The same with a 32-bit displacement, for longer fix-up sequences */
+static uint8_t *fpo_jcc32(TCGContext *s, int cond)
+{
+    if (cond == JCC_JMP) {
+        tcg_out8(s, OPC_JMP_long);
+    } else {
+        tcg_out8(s, 0x0f);
+        tcg_out8(s, 0x80 + cond);           /* jcc rel32: 0f 8x */
+    }
+    tcg_out32(s, 0);
+    return s->code_ptr - 4;
+}
+
+static void fpo_patch32(TCGContext *s, uint8_t *p)
+{
+    ptrdiff_t d = s->code_ptr - (p + 4);
+    tcg_debug_assert(d >= 0 && d <= INT32_MAX);
+    stl_le_p(p, d);
+}
+
 static int fpo_pfx(bool scalar, bool dbl)
 {
     if (dbl) {
@@ -475,7 +495,7 @@ static void fpo_fix_nan_arm(TCGContext *s, int d, const int *in, int nin,
     /* k1 = NaN results (lane 0 only for scalars); nothing to do without */
     fpo_rrri(s, cmp, FPK1, d, d, 0, false, FPO_PRED_UNORD_Q);
     tcg_out_vex_modrm(s, FPO_KORTESTB, FPK1, 0, FPK1);
-    done = fpo_jcc8(s, JCC_JE);
+    done = fpo_jcc32(s, JCC_JE);
 
     /* operands by increasing priority */
     if (nin == 3) {
@@ -514,7 +534,7 @@ static void fpo_fix_nan_arm(TCGContext *s, int d, const int *in, int nin,
         fpo_kop(s, FPO_KANDB, FPK2, FPK2, FPK3);
         fpo_ldc_k(s, d, dbl, dbl ? 0x7ff8000000000000ull : 0x7fc00000u, FPK2);
     }
-    fpo_patch8(s, done);
+    fpo_patch32(s, done);
 }
 
 static void fpo_round_sp(TCGContext *s, int d, int a, bool scalar)
@@ -663,7 +683,7 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
             fpo_rrri(s, cls, FPK1, 0, a, 0, false, 0x81);          /* a NaN */
             fpo_rrri(s, cls, FPK2, 0, b, 0, false, 0x81);          /* b NaN */
             tcg_out_vex_modrm(s, FPO_KORTESTB, FPK1, 0, FPK2);
-            done = fpo_jcc8(s, JCC_JE);
+            done = fpo_jcc32(s, JCC_JE);
             /* NaN lanes: quiet(a) if a is a NaN, else quiet(b) */
             fpo_rrc(s, por, d, b, FPK2, false, fpo_quiet_bit(dbl));
             fpo_rrc(s, por, d, a, FPK1, false, fpo_quiet_bit(dbl));
@@ -681,7 +701,7 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
                 fpo_kop(s, FPO_KANDNB, FPK3, FPK1, FPK3);
                 fpo_rrc(s, por, d, b, FPK3, false, fpo_quiet_bit(dbl));
             }
-            fpo_patch8(s, done);
+            fpo_patch32(s, done);
         }
         return;
     case TCG_FPOP_MAX:
@@ -701,7 +721,7 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
             fpo_class(s, FPK1, a, scalar, dbl, FPO_CLS_NAN);
             fpo_class(s, FPK2, b, scalar, dbl, FPO_CLS_NAN);
             tcg_out_vex_modrm(s, FPO_KORTESTB, FPK1, 0, FPK2);
-            done = fpo_jcc8(s, JCC_JE);
+            done = fpo_jcc32(s, JCC_JE);
             fpo_rrc(s, por, d, b, FPK2, false, fpo_quiet_bit(dbl));
             fpo_rrc(s, por, d, a, FPK1, false, fpo_quiet_bit(dbl));
             if (fpop & TCG_FPOP_F_SNAN_FIRST) {
@@ -710,7 +730,7 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
                 fpo_kop(s, FPO_KANDNB, FPK3, FPK1, FPK3);
                 fpo_rrc(s, por, d, b, FPK3, false, fpo_quiet_bit(dbl));
             }
-            fpo_patch8(s, done);
+            fpo_patch32(s, done);
         }
         return;
     case TCG_FPOP_MINC:

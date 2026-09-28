@@ -9,6 +9,7 @@
 #include "helper.h"
 #include "internals.h"
 #include "cpu-features.h"
+#include "tcg/tcg-fpop.h"
 
 /* internal defines */
 
@@ -194,6 +195,12 @@ typedef struct DisasContext {
     bool fpcr_ah;
     /* True if FPCR.NEP is 1 (FEAT_AFP scalar upper-element result handling) */
     bool fpcr_nep;
+    /*
+     * FP instructions are compiled to host FP code (TCG fpops) rather
+     * than helpers: FPCR in its default state (TB flag FPSOFT clear), see
+     * translate-a64.c and translate-vfp.c.
+     */
+    bool fpj;
     /* True if GCSEnabled. */
     bool gcs_en;
     /* True if GCSReturnValueCheckEnabled. */
@@ -920,5 +927,15 @@ static inline void gen_event_reg(void)
         s->is_nonstreaming = !dc_isar_feature(FEAT_STREAM, s);    \
         return dc_isar_feature(FEAT, s) && FUNC(s, __VA_ARGS__);  \
     }
+
+
+/*
+ * Host FP code for Arm FP instructions (see include/tcg/tcg-fpop.h): the
+ * Arm NaN rules of FPProcessNaNs with FPCR.DN == 0, which the ops need
+ * besides FPCR.FZ == 0, RMode == RN and AH == 0 (ARM_FPJ_SOFT_MASK).
+ * QEMU_ARM_FPJIT=0 in the environment keeps the helpers.
+ */
+#define ARM_FPJ_NAN     (TCG_FPOP_F_DEFNAN | TCG_FPOP_F_SNAN_FIRST)
+bool arm_fpj_enabled(void);
 
 #endif /* TARGET_ARM_TRANSLATE_H */

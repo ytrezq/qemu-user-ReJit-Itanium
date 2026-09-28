@@ -6043,16 +6043,104 @@ static bool trans_INS_element(DisasContext *s, arg_INS_element *a)
  * Advanced SIMD three same
  */
 
+/*
+ * FP instructions in host FP code (TCG fpops, include/tcg/tcg-fpop.h),
+ * when FPCR is in its default state (dc->fpj, TB flag FPSOFT clear):
+ * operands go straight from the vector registers in env to host vector
+ * registers and back, TCG_TYPE_V64 for scalars (lane 0) and TCG_TYPE_V128
+ * for vectors, and the exception flags accumulate in the host status
+ * register until FPSR is read (vfp_get_fpsr_from_host).  NaNs follow the
+ * FPProcessNaNs rules (ARM_FPJ_NAN); FPNeg and FPAbs, which also flip or
+ * clear the sign of NaNs, are plain sign bit operations.
+ */
+enum {
+    FPJ_NEG_RES = 1,    /* FPNeg of the result */
+    FPJ_ABS_RES = 2,    /* FPAbs of the result */
+    FPJ_ABS_IN = 4,     /* FPAbs of the operands (FACGE, FACGT) */
+    FPJ_NEG_N = 8,      /* FPNeg of the first operand (FMLS) */
+    FPJ_SWAP = 16,      /* operands swapped (compares with zero) */
+};
+
+static bool fpj_ok(DisasContext *s, MemOp esz, TCGType type, unsigned fpop)
+{
+    return s->fpj && (esz == MO_32 || esz == MO_64)
+           && tcg_can_emit_fpop(fpop, type, esz);
+}
+
+static TCGv_vec fpj_ld(DisasContext *s, TCGType type, int reg)
+{
+    TCGv_vec v = tcg_temp_new_vec(type);
+
+    tcg_gen_ld_vec(v, tcg_env, vec_full_reg_offset(s, reg));
+    return v;
+}
+
+/* Write a scalar (V64: the other 64 bits of Qn cleared) or a vector */
+static void fpj_st(DisasContext *s, TCGType type, int reg, TCGv_vec v)
+{
+    tcg_gen_st_vec(v, tcg_env, vec_full_reg_offset(s, reg));
+    clear_vec_high(s, type == TCG_TYPE_V128, reg);
+}
+
+/* d = FPNeg(a) or FPAbs(a), elementwise (scalars: lane 0 only) */
+static void fpj_sign(TCGType type, MemOp esz, TCGv_vec d, TCGv_vec a,
+                     bool abs)
+{
+    uint64_t sign = esz == MO_64 ? INT64_MIN : 0x80000000u;
+    MemOp ve = type == TCG_TYPE_V64 ? MO_64 : esz;
+
+    if (abs) {
+        tcg_gen_and_vec(ve, d, a, tcg_constant_vec(type, ve, sign - 1));
+    } else {
+        tcg_gen_xor_vec(ve, d, a, tcg_constant_vec(type, ve, sign));
+    }
+}
+
+/* d = fpop(n, m) with the FPJ_* adjustments */
+static void fpj_op2(TCGType type, MemOp esz, TCGv_vec d, TCGv_vec n,
+                    TCGv_vec m, unsigned fpop, int adj)
+{
+    if (adj & FPJ_ABS_IN) {
+        fpj_sign(type, esz, n, n, true);
+        fpj_sign(type, esz, m, m, true);
+    }
+    if (adj & FPJ_SWAP) {
+        TCGv_vec t = n;
+        n = m;
+        m = t;
+    }
+    tcg_gen_fpop2_vec(esz, d, n, m, fpop);
+    if (adj & (FPJ_NEG_RES | FPJ_ABS_RES)) {
+        fpj_sign(type, esz, d, d, adj & FPJ_ABS_RES);
+    }
+}
+
 typedef struct FPScalar {
     void (*gen_h)(TCGv_i32, TCGv_i32, TCGv_i32, TCGv_ptr);
     void (*gen_s)(TCGv_i32, TCGv_i32, TCGv_i32, TCGv_ptr);
     void (*gen_d)(TCGv_i64, TCGv_i64, TCGv_i64, TCGv_ptr);
+    /* the same in host FP code: fpop2 and FPJ_* adjustments, or 0 */
+    unsigned fpop;
+    int fpj_adj;
 } FPScalar;
 
 static bool do_fp3_scalar_with_fpsttype(DisasContext *s, arg_rrr_e *a,
                                         const FPScalar *f, int mergereg,
                                         ARMFPStatusFlavour fpsttype)
 {
+    if (f->fpop && fpsttype == FPST_A64
+        && fpj_ok(s, a->esz, TCG_TYPE_V64, f->fpop)) {
+        if (fp_access_check(s)) {
+            TCGv_vec n = fpj_ld(s, TCG_TYPE_V64, a->rn);
+            TCGv_vec m = fpj_ld(s, TCG_TYPE_V64, a->rm);
+            TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
+
+            fpj_op2(TCG_TYPE_V64, a->esz, d, n, m, f->fpop, f->fpj_adj);
+            fpj_st(s, TCG_TYPE_V64, a->rd, d);
+        }
+        return true;
+    }
+
     switch (a->esz) {
     case MO_64:
         if (fp_access_check(s)) {
@@ -6116,6 +6204,7 @@ static const FPScalar f_scalar_fadd = {
     gen_helper_vfp_addh,
     gen_helper_vfp_adds,
     gen_helper_vfp_addd,
+    .fpop = TCG_FPOP_ADD | ARM_FPJ_NAN,
 };
 TRANS(FADD_s, do_fp3_scalar, a, &f_scalar_fadd, a->rn)
 
@@ -6123,6 +6212,7 @@ static const FPScalar f_scalar_fsub = {
     gen_helper_vfp_subh,
     gen_helper_vfp_subs,
     gen_helper_vfp_subd,
+    .fpop = TCG_FPOP_SUB | ARM_FPJ_NAN,
 };
 TRANS(FSUB_s, do_fp3_scalar, a, &f_scalar_fsub, a->rn)
 
@@ -6130,6 +6220,7 @@ static const FPScalar f_scalar_fdiv = {
     gen_helper_vfp_divh,
     gen_helper_vfp_divs,
     gen_helper_vfp_divd,
+    .fpop = TCG_FPOP_DIV | ARM_FPJ_NAN,
 };
 TRANS(FDIV_s, do_fp3_scalar, a, &f_scalar_fdiv, a->rn)
 
@@ -6137,6 +6228,7 @@ static const FPScalar f_scalar_fmul = {
     gen_helper_vfp_mulh,
     gen_helper_vfp_muls,
     gen_helper_vfp_muld,
+    .fpop = TCG_FPOP_MUL | ARM_FPJ_NAN,
 };
 TRANS(FMUL_s, do_fp3_scalar, a, &f_scalar_fmul, a->rn)
 
@@ -6144,6 +6236,7 @@ static const FPScalar f_scalar_fmax = {
     gen_helper_vfp_maxh,
     gen_helper_vfp_maxs,
     gen_helper_vfp_maxd,
+    .fpop = TCG_FPOP_MAX | ARM_FPJ_NAN,
 };
 static const FPScalar f_scalar_fmax_ah = {
     gen_helper_vfp_ah_maxh,
@@ -6156,6 +6249,7 @@ static const FPScalar f_scalar_fmin = {
     gen_helper_vfp_minh,
     gen_helper_vfp_mins,
     gen_helper_vfp_mind,
+    .fpop = TCG_FPOP_MIN | ARM_FPJ_NAN,
 };
 static const FPScalar f_scalar_fmin_ah = {
     gen_helper_vfp_ah_minh,
@@ -6168,6 +6262,7 @@ static const FPScalar f_scalar_fmaxnm = {
     gen_helper_vfp_maxnumh,
     gen_helper_vfp_maxnums,
     gen_helper_vfp_maxnumd,
+    .fpop = TCG_FPOP_MAXNUM | ARM_FPJ_NAN,
 };
 TRANS(FMAXNM_s, do_fp3_scalar, a, &f_scalar_fmaxnm, a->rn)
 
@@ -6175,6 +6270,7 @@ static const FPScalar f_scalar_fminnm = {
     gen_helper_vfp_minnumh,
     gen_helper_vfp_minnums,
     gen_helper_vfp_minnumd,
+    .fpop = TCG_FPOP_MINNUM | ARM_FPJ_NAN,
 };
 TRANS(FMINNM_s, do_fp3_scalar, a, &f_scalar_fminnm, a->rn)
 
@@ -6225,6 +6321,8 @@ static const FPScalar f_scalar_fnmul = {
     gen_fnmul_h,
     gen_fnmul_s,
     gen_fnmul_d,
+    .fpop = TCG_FPOP_MUL | ARM_FPJ_NAN,
+    .fpj_adj = FPJ_NEG_RES,
 };
 static const FPScalar f_scalar_ah_fnmul = {
     gen_fnmul_ah_h,
@@ -6237,6 +6335,7 @@ static const FPScalar f_scalar_fcmeq = {
     gen_helper_advsimd_ceq_f16,
     gen_helper_neon_ceq_f32,
     gen_helper_neon_ceq_f64,
+    .fpop = TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_EQ),
 };
 TRANS(FCMEQ_s, do_fp3_scalar, a, &f_scalar_fcmeq, a->rm)
 
@@ -6244,6 +6343,7 @@ static const FPScalar f_scalar_fcmge = {
     gen_helper_advsimd_cge_f16,
     gen_helper_neon_cge_f32,
     gen_helper_neon_cge_f64,
+    .fpop = TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_GE) | TCG_FPOP_F_SIGNAL,
 };
 TRANS(FCMGE_s, do_fp3_scalar, a, &f_scalar_fcmge, a->rm)
 
@@ -6251,6 +6351,7 @@ static const FPScalar f_scalar_fcmgt = {
     gen_helper_advsimd_cgt_f16,
     gen_helper_neon_cgt_f32,
     gen_helper_neon_cgt_f64,
+    .fpop = TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_GT) | TCG_FPOP_F_SIGNAL,
 };
 TRANS(FCMGT_s, do_fp3_scalar, a, &f_scalar_fcmgt, a->rm)
 
@@ -6258,6 +6359,8 @@ static const FPScalar f_scalar_facge = {
     gen_helper_advsimd_acge_f16,
     gen_helper_neon_acge_f32,
     gen_helper_neon_acge_f64,
+    .fpop = TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_GE) | TCG_FPOP_F_SIGNAL,
+    .fpj_adj = FPJ_ABS_IN,
 };
 TRANS(FACGE_s, do_fp3_scalar, a, &f_scalar_facge, a->rm)
 
@@ -6265,6 +6368,8 @@ static const FPScalar f_scalar_facgt = {
     gen_helper_advsimd_acgt_f16,
     gen_helper_neon_acgt_f32,
     gen_helper_neon_acgt_f64,
+    .fpop = TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_GT) | TCG_FPOP_F_SIGNAL,
+    .fpj_adj = FPJ_ABS_IN,
 };
 TRANS(FACGT_s, do_fp3_scalar, a, &f_scalar_facgt, a->rm)
 
@@ -6308,6 +6413,8 @@ static const FPScalar f_scalar_fabd = {
     gen_fabd_h,
     gen_fabd_s,
     gen_fabd_d,
+    .fpop = TCG_FPOP_SUB | ARM_FPJ_NAN,
+    .fpj_adj = FPJ_ABS_RES,
 };
 static const FPScalar f_scalar_ah_fabd = {
     gen_fabd_ah_h,
@@ -6631,33 +6738,81 @@ static bool do_fp3_vector_ah_2fn(DisasContext *s, arg_qrrr_e *a, int data,
                                        select_ah_fpst(s, a->esz));
 }
 
+/*
+ * The same, 128-bit vectors in host FP code if possible: fpop2 with the
+ * FPJ_* adjustments, or TCG_FPOP_FMA for Vd += Vn * Vm (FMLA, FMLS).
+ */
+static bool do_fp3_vector_j(DisasContext *s, arg_qrrr_e *a, int data,
+                            gen_helper_gvec_3_ptr * const fns[3],
+                            unsigned fpop, int adj)
+{
+    if (a->q && fpj_ok(s, a->esz, TCG_TYPE_V128, fpop)) {
+        TCGv_vec n, m, d;
+
+        if (!fp_access_check(s)) {
+            return true;
+        }
+        n = fpj_ld(s, TCG_TYPE_V128, a->rn);
+        m = fpj_ld(s, TCG_TYPE_V128, a->rm);
+        d = tcg_temp_new_vec(TCG_TYPE_V128);
+        if (TCG_FPOP_OP(fpop) == TCG_FPOP_FMA) {
+            TCGv_vec acc = fpj_ld(s, TCG_TYPE_V128, a->rd);
+
+            if (adj & FPJ_NEG_N) {
+                fpj_sign(TCG_TYPE_V128, a->esz, n, n, false);
+            }
+            tcg_gen_fpop3_vec(a->esz, d, n, m, acc, fpop);
+        } else {
+            fpj_op2(TCG_TYPE_V128, a->esz, d, n, m, fpop, adj);
+        }
+        fpj_st(s, TCG_TYPE_V128, a->rd, d);
+        return true;
+    }
+    return do_fp3_vector(s, a, data, fns);
+}
+
+static bool do_fp3_vector_2fn_j(DisasContext *s, arg_qrrr_e *a, int data,
+                                gen_helper_gvec_3_ptr * const fnormal[3],
+                                gen_helper_gvec_3_ptr * const fah[3],
+                                unsigned fpop, int adj)
+{
+    if (s->fpcr_ah) {
+        return do_fp3_vector(s, a, data, fah);
+    }
+    return do_fp3_vector_j(s, a, data, fnormal, fpop, adj);
+}
+
 static gen_helper_gvec_3_ptr * const f_vector_fadd[3] = {
     gen_helper_gvec_fadd_h,
     gen_helper_gvec_fadd_s,
     gen_helper_gvec_fadd_d,
 };
-TRANS(FADD_v, do_fp3_vector, a, 0, f_vector_fadd)
+TRANS(FADD_v, do_fp3_vector_j, a, 0, f_vector_fadd,
+      TCG_FPOP_ADD | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fsub[3] = {
     gen_helper_gvec_fsub_h,
     gen_helper_gvec_fsub_s,
     gen_helper_gvec_fsub_d,
 };
-TRANS(FSUB_v, do_fp3_vector, a, 0, f_vector_fsub)
+TRANS(FSUB_v, do_fp3_vector_j, a, 0, f_vector_fsub,
+      TCG_FPOP_SUB | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fdiv[3] = {
     gen_helper_gvec_fdiv_h,
     gen_helper_gvec_fdiv_s,
     gen_helper_gvec_fdiv_d,
 };
-TRANS(FDIV_v, do_fp3_vector, a, 0, f_vector_fdiv)
+TRANS(FDIV_v, do_fp3_vector_j, a, 0, f_vector_fdiv,
+      TCG_FPOP_DIV | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmul[3] = {
     gen_helper_gvec_fmul_h,
     gen_helper_gvec_fmul_s,
     gen_helper_gvec_fmul_d,
 };
-TRANS(FMUL_v, do_fp3_vector, a, 0, f_vector_fmul)
+TRANS(FMUL_v, do_fp3_vector_j, a, 0, f_vector_fmul,
+      TCG_FPOP_MUL | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmax[3] = {
     gen_helper_gvec_fmax_h,
@@ -6669,7 +6824,8 @@ static gen_helper_gvec_3_ptr * const f_vector_fmax_ah[3] = {
     gen_helper_gvec_ah_fmax_s,
     gen_helper_gvec_ah_fmax_d,
 };
-TRANS(FMAX_v, do_fp3_vector_2fn, a, 0, f_vector_fmax, f_vector_fmax_ah)
+TRANS(FMAX_v, do_fp3_vector_2fn_j, a, 0, f_vector_fmax, f_vector_fmax_ah,
+      TCG_FPOP_MAX | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmin[3] = {
     gen_helper_gvec_fmin_h,
@@ -6681,21 +6837,24 @@ static gen_helper_gvec_3_ptr * const f_vector_fmin_ah[3] = {
     gen_helper_gvec_ah_fmin_s,
     gen_helper_gvec_ah_fmin_d,
 };
-TRANS(FMIN_v, do_fp3_vector_2fn, a, 0, f_vector_fmin, f_vector_fmin_ah)
+TRANS(FMIN_v, do_fp3_vector_2fn_j, a, 0, f_vector_fmin, f_vector_fmin_ah,
+      TCG_FPOP_MIN | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmaxnm[3] = {
     gen_helper_gvec_fmaxnum_h,
     gen_helper_gvec_fmaxnum_s,
     gen_helper_gvec_fmaxnum_d,
 };
-TRANS(FMAXNM_v, do_fp3_vector, a, 0, f_vector_fmaxnm)
+TRANS(FMAXNM_v, do_fp3_vector_j, a, 0, f_vector_fmaxnm,
+      TCG_FPOP_MAXNUM | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fminnm[3] = {
     gen_helper_gvec_fminnum_h,
     gen_helper_gvec_fminnum_s,
     gen_helper_gvec_fminnum_d,
 };
-TRANS(FMINNM_v, do_fp3_vector, a, 0, f_vector_fminnm)
+TRANS(FMINNM_v, do_fp3_vector_j, a, 0, f_vector_fminnm,
+      TCG_FPOP_MINNUM | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmulx[3] = {
     gen_helper_gvec_fmulx_h,
@@ -6709,7 +6868,8 @@ static gen_helper_gvec_3_ptr * const f_vector_fmla[3] = {
     gen_helper_gvec_vfma_s,
     gen_helper_gvec_vfma_d,
 };
-TRANS(FMLA_v, do_fp3_vector, a, 0, f_vector_fmla)
+TRANS(FMLA_v, do_fp3_vector_j, a, 0, f_vector_fmla,
+      TCG_FPOP_FMA | ARM_FPJ_NAN, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fmls[3] = {
     gen_helper_gvec_vfms_h,
@@ -6721,42 +6881,50 @@ static gen_helper_gvec_3_ptr * const f_vector_fmls_ah[3] = {
     gen_helper_gvec_ah_vfms_s,
     gen_helper_gvec_ah_vfms_d,
 };
-TRANS(FMLS_v, do_fp3_vector_2fn, a, 0, f_vector_fmls, f_vector_fmls_ah)
+TRANS(FMLS_v, do_fp3_vector_2fn_j, a, 0, f_vector_fmls, f_vector_fmls_ah,
+      TCG_FPOP_FMA | ARM_FPJ_NAN, FPJ_NEG_N)
 
 static gen_helper_gvec_3_ptr * const f_vector_fcmeq[3] = {
     gen_helper_gvec_fceq_h,
     gen_helper_gvec_fceq_s,
     gen_helper_gvec_fceq_d,
 };
-TRANS(FCMEQ_v, do_fp3_vector, a, 0, f_vector_fcmeq)
+TRANS(FCMEQ_v, do_fp3_vector_j, a, 0, f_vector_fcmeq,
+      TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_EQ), 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fcmge[3] = {
     gen_helper_gvec_fcge_h,
     gen_helper_gvec_fcge_s,
     gen_helper_gvec_fcge_d,
 };
-TRANS(FCMGE_v, do_fp3_vector, a, 0, f_vector_fcmge)
+TRANS(FCMGE_v, do_fp3_vector_j, a, 0, f_vector_fcmge,
+      TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_GE) | TCG_FPOP_F_SIGNAL, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_fcmgt[3] = {
     gen_helper_gvec_fcgt_h,
     gen_helper_gvec_fcgt_s,
     gen_helper_gvec_fcgt_d,
 };
-TRANS(FCMGT_v, do_fp3_vector, a, 0, f_vector_fcmgt)
+TRANS(FCMGT_v, do_fp3_vector_j, a, 0, f_vector_fcmgt,
+      TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_GT) | TCG_FPOP_F_SIGNAL, 0)
 
 static gen_helper_gvec_3_ptr * const f_vector_facge[3] = {
     gen_helper_gvec_facge_h,
     gen_helper_gvec_facge_s,
     gen_helper_gvec_facge_d,
 };
-TRANS(FACGE_v, do_fp3_vector, a, 0, f_vector_facge)
+TRANS(FACGE_v, do_fp3_vector_j, a, 0, f_vector_facge,
+      TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_GE) | TCG_FPOP_F_SIGNAL,
+      FPJ_ABS_IN)
 
 static gen_helper_gvec_3_ptr * const f_vector_facgt[3] = {
     gen_helper_gvec_facgt_h,
     gen_helper_gvec_facgt_s,
     gen_helper_gvec_facgt_d,
 };
-TRANS(FACGT_v, do_fp3_vector, a, 0, f_vector_facgt)
+TRANS(FACGT_v, do_fp3_vector_j, a, 0, f_vector_facgt,
+      TCG_FPOP_CMP | TCG_FPOP_PRED(TCG_FPPRED_GT) | TCG_FPOP_F_SIGNAL,
+      FPJ_ABS_IN)
 
 static gen_helper_gvec_3_ptr * const f_vector_fabd[3] = {
     gen_helper_gvec_fabd_h,
@@ -6768,7 +6936,8 @@ static gen_helper_gvec_3_ptr * const f_vector_ah_fabd[3] = {
     gen_helper_gvec_ah_fabd_s,
     gen_helper_gvec_ah_fabd_d,
 };
-TRANS(FABD_v, do_fp3_vector_2fn, a, 0, f_vector_fabd, f_vector_ah_fabd)
+TRANS(FABD_v, do_fp3_vector_2fn_j, a, 0, f_vector_fabd, f_vector_ah_fabd,
+      TCG_FPOP_SUB | ARM_FPJ_NAN, FPJ_ABS_RES)
 
 static gen_helper_gvec_3_ptr * const f_vector_frecps[3] = {
     gen_helper_gvec_recps_h,
@@ -8051,6 +8220,26 @@ static bool do_fmadd(DisasContext *s, arg_rrrr_e *a, bool neg_a, bool neg_n)
      * as separate steps is correct: an input NaN should come out with
      * its sign bit flipped if it is a negated-input.
      */
+    if (fpj_ok(s, a->esz, TCG_TYPE_V64, TCG_FPOP_FMA | ARM_FPJ_NAN)) {
+        if (fp_access_check(s)) {
+            TCGv_vec n = fpj_ld(s, TCG_TYPE_V64, a->rn);
+            TCGv_vec m = fpj_ld(s, TCG_TYPE_V64, a->rm);
+            TCGv_vec ra = fpj_ld(s, TCG_TYPE_V64, a->ra);
+            TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
+
+            if (neg_a) {
+                fpj_sign(TCG_TYPE_V64, a->esz, ra, ra, false);
+            }
+            if (neg_n) {
+                fpj_sign(TCG_TYPE_V64, a->esz, n, n, false);
+            }
+            tcg_gen_fpop3_vec(a->esz, d, n, m, ra,
+                              TCG_FPOP_FMA | ARM_FPJ_NAN);
+            fpj_st(s, TCG_TYPE_V64, a->rd, d);
+        }
+        return true;
+    }
+
     switch (a->esz) {
     case MO_64:
         if (fp_access_check(s)) {
@@ -8249,7 +8438,24 @@ static void handle_fp_compare(DisasContext *s, int size,
                               bool cmp_with_zero, bool signal_all_nans)
 {
     TCGv_i64 tcg_flags = tcg_temp_new_i64();
-    TCGv_ptr fpst = fpstatus_ptr(size == MO_16 ? FPST_A64_F16 : FPST_A64);
+    TCGv_ptr fpst;
+    unsigned fpop = TCG_FPOP_F_CC_NZCV
+                    | (signal_all_nans ? TCG_FPOP_F_SIGNAL : 0);
+
+    if (fpj_ok(s, size, TCG_TYPE_V64, TCG_FPOP_CMP)) {
+        /* NZCV straight from the host compare */
+        TCGv_vec n = fpj_ld(s, TCG_TYPE_V64, rn);
+        TCGv_vec m = cmp_with_zero
+                     ? tcg_constant_vec(TCG_TYPE_V64, MO_64, 0)
+                     : fpj_ld(s, TCG_TYPE_V64, rm);
+        TCGv_i32 nzcv = tcg_temp_new_i32();
+
+        tcg_gen_fpcmpcc_vec(size, nzcv, n, m, fpop);
+        tcg_gen_extu_i32_i64(tcg_flags, nzcv);
+        gen_set_nzcv(tcg_flags);
+        return;
+    }
+    fpst = fpstatus_ptr(size == MO_16 ? FPST_A64_F16 : FPST_A64);
 
     if (size == MO_64) {
         TCGv_i64 tcg_vn, tcg_vm;
@@ -9791,7 +9997,35 @@ typedef struct FPScalar1 {
     void (*gen_h)(TCGv_i32, TCGv_i32, TCGv_ptr);
     void (*gen_s)(TCGv_i32, TCGv_i32, TCGv_ptr);
     void (*gen_d)(TCGv_i64, TCGv_i64, TCGv_ptr);
+    /*
+     * the same in host FP code: fpop1, or 0; for TCG_FPOP_RINT, the
+     * rounding mode comes from the rmode argument (-1: FPCR, i.e. to
+     * nearest, which then raises inexact only if it is TCG_FPRND_CURRENT)
+     */
+    unsigned fpop;
 } FPScalar1;
+
+/* fpop of an FPScalar1 used with rounding mode @rmode, or 0 */
+static unsigned fpj_fp1_op(const FPScalar1 *f, int rmode)
+{
+    static const uint8_t rnd[] = {
+        [FPROUNDING_TIEEVEN] = TCG_FPRND_NEAREST_EVEN,
+        [FPROUNDING_POSINF] = TCG_FPRND_UP,
+        [FPROUNDING_NEGINF] = TCG_FPRND_DOWN,
+        [FPROUNDING_ZERO] = TCG_FPRND_ZERO,
+    };
+
+    if (TCG_FPOP_OP(f->fpop) != TCG_FPOP_RINT) {
+        return rmode < 0 ? f->fpop : 0;
+    }
+    if (rmode < 0) {
+        return f->fpop;
+    }
+    if (rmode > FPROUNDING_ZERO || TCG_FPOP_GET_RMODE(f->fpop)) {
+        return 0;
+    }
+    return f->fpop | TCG_FPOP_RMODE(rnd[rmode]);
+}
 
 static bool do_fp1_scalar_with_fpsttype(DisasContext *s, arg_rr_e *a,
                                         const FPScalar1 *f, int rmode,
@@ -9802,9 +10036,19 @@ static bool do_fp1_scalar_with_fpsttype(DisasContext *s, arg_rr_e *a,
     TCGv_i64 t64;
     TCGv_i32 t32;
     int check = fp_access_check_scalar_hsd(s, a->esz);
+    unsigned fpop = f->fpop ? fpj_fp1_op(f, rmode) : 0;
 
     if (check <= 0) {
         return check == 0;
+    }
+    if (fpop && fpsttype == FPST_A64
+        && fpj_ok(s, a->esz, TCG_TYPE_V64, fpop)) {
+        TCGv_vec n = fpj_ld(s, TCG_TYPE_V64, a->rn);
+        TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
+
+        tcg_gen_fpop1_vec(a->esz, d, n, fpop);
+        fpj_st(s, TCG_TYPE_V64, a->rd, d);
+        return true;
     }
 
     fpst = fpstatus_ptr(fpsttype);
@@ -9856,6 +10100,7 @@ static const FPScalar1 f_scalar_fsqrt = {
     gen_helper_vfp_sqrth,
     gen_helper_vfp_sqrts,
     gen_helper_vfp_sqrtd,
+    .fpop = TCG_FPOP_SQRT | ARM_FPJ_NAN,
 };
 TRANS(FSQRT_s, do_fp1_scalar, a, &f_scalar_fsqrt, -1)
 
@@ -9863,6 +10108,7 @@ static const FPScalar1 f_scalar_frint = {
     gen_helper_advsimd_rinth,
     gen_helper_rints,
     gen_helper_rintd,
+    .fpop = TCG_FPOP_RINT,
 };
 TRANS(FRINTN_s, do_fp1_scalar, a, &f_scalar_frint, FPROUNDING_TIEEVEN)
 TRANS(FRINTP_s, do_fp1_scalar, a, &f_scalar_frint, FPROUNDING_POSINF)
@@ -9875,6 +10121,7 @@ static const FPScalar1 f_scalar_frintx = {
     gen_helper_advsimd_rinth_exact,
     gen_helper_rints_exact,
     gen_helper_rintd_exact,
+    .fpop = TCG_FPOP_RINT | TCG_FPOP_RMODE(TCG_FPRND_CURRENT),
 };
 TRANS(FRINTX_s, do_fp1_scalar, a, &f_scalar_frintx, -1)
 
@@ -9955,6 +10202,16 @@ TRANS(FRSQRTE_s, do_fp1_scalar_ah, a,
 
 static bool trans_FCVT_s_ds(DisasContext *s, arg_rr *a)
 {
+    if (fpj_ok(s, MO_32, TCG_TYPE_V64, TCG_FPOP_CVT_F64)) {
+        if (fp_access_check(s)) {
+            TCGv_vec n = fpj_ld(s, TCG_TYPE_V64, a->rn);
+            TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
+
+            tcg_gen_fpop1_vec(MO_32, d, n, TCG_FPOP_CVT_F64);
+            fpj_st(s, TCG_TYPE_V64, a->rd, d);
+        }
+        return true;
+    }
     if (fp_access_check(s)) {
         TCGv_i32 tcg_rn = read_fp_sreg(s, a->rn);
         TCGv_i64 tcg_rd = tcg_temp_new_i64();
@@ -9982,6 +10239,16 @@ static bool trans_FCVT_s_hs(DisasContext *s, arg_rr *a)
 
 static bool trans_FCVT_s_sd(DisasContext *s, arg_rr *a)
 {
+    if (fpj_ok(s, MO_64, TCG_TYPE_V64, TCG_FPOP_CVT_F32)) {
+        if (fp_access_check(s)) {
+            TCGv_vec n = fpj_ld(s, TCG_TYPE_V64, a->rn);
+            TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
+
+            tcg_gen_fpop1_vec(MO_64, d, n, TCG_FPOP_CVT_F32);
+            fpj_st(s, TCG_TYPE_V64, a->rd, d);
+        }
+        return true;
+    }
     if (fp_access_check(s)) {
         TCGv_i64 tcg_rn = read_fp_dreg(s, a->rn);
         TCGv_i32 tcg_rd = tcg_temp_new_i32();
@@ -10042,6 +10309,19 @@ static bool do_cvtf_scalar(DisasContext *s, MemOp esz, int rd, int shift,
     TCGv_ptr tcg_fpstatus;
     TCGv_i32 tcg_shift, tcg_single;
     TCGv_i64 tcg_double;
+    unsigned fpop = (is_signed ? TCG_FPOP_CVT_S : TCG_FPOP_CVT_U)
+                    | (esz == MO_32 ? TCG_FPOP_F_RES32 : 0);
+
+    if (shift == 0 && (esz == MO_32 || esz == MO_64)
+        && fpj_ok(s, MO_64, TCG_TYPE_V64, fpop)) {
+        /* the 64-bit integer to binary64 or binary32 */
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V64);
+
+        tcg_gen_dup_i64_vec(MO_64, v, tcg_int);
+        tcg_gen_fpop1_vec(MO_64, v, v, fpop);
+        fpj_st(s, TCG_TYPE_V64, rd, v);
+        return true;
+    }
 
     tcg_fpstatus = fpstatus_ptr(esz == MO_16 ? FPST_A64_F16 : FPST_A64);
     tcg_shift = tcg_constant_i32(shift);
@@ -10241,6 +10521,41 @@ static void do_fcvt_scalar(DisasContext *s, MemOp out, MemOp esz,
     gen_restore_rmode(tcg_rmode, tcg_fpstatus);
 }
 
+/*
+ * FCVTZS, FCVTZU in host FP code: out = MO_32 or MO_64 (| MO_SIGN), esz
+ * the FP format; the result moves to tcg_out through env (fpj_scratch).
+ */
+static bool fpj_fcvtz(DisasContext *s, MemOp out, MemOp esz,
+                      TCGv_i64 tcg_out, int rn)
+{
+    bool sgn = out & MO_SIGN;
+    bool out64 = (out & MO_SIZE) == MO_64;
+    unsigned fpop = TCG_FPOP_F_TRUNC | TCG_FPOP_F_PPC_SAT
+                    | (sgn ? TCG_FPOP_F_NAN_ZERO : 0);
+    TCGv_vec v;
+
+    if (esz == MO_64) {
+        fpop |= out64 ? (sgn ? TCG_FPOP_CVTI_S : TCG_FPOP_CVTI_U)
+                      : (sgn ? TCG_FPOP_CVTI_S32 : TCG_FPOP_CVTI_U32);
+    } else {
+        fpop |= out64 ? (sgn ? TCG_FPOP_CVTI_S64 : TCG_FPOP_CVTI_U64)
+                      : (sgn ? TCG_FPOP_CVTI_S : TCG_FPOP_CVTI_U);
+    }
+    if (!fpj_ok(s, esz, TCG_TYPE_V64, fpop)) {
+        return false;
+    }
+    v = fpj_ld(s, TCG_TYPE_V64, rn);
+    tcg_gen_fpop1_vec(esz, v, v, fpop);
+    tcg_gen_st_vec(v, tcg_env, offsetof(CPUARMState, vfp.fpj_scratch));
+    if (out64) {
+        tcg_gen_ld_i64(tcg_out, tcg_env, offsetof(CPUARMState, vfp.fpj_scratch));
+    } else {
+        tcg_gen_ld32u_i64(tcg_out, tcg_env,
+                          offsetof(CPUARMState, vfp.fpj_scratch));
+    }
+    return true;
+}
+
 static bool do_fcvt_g(DisasContext *s, arg_fcvt *a,
                       ARMFPRounding rmode, bool is_signed)
 {
@@ -10249,6 +10564,11 @@ static bool do_fcvt_g(DisasContext *s, arg_fcvt *a,
 
     if (check <= 0) {
         return check == 0;
+    }
+    if (rmode == FPROUNDING_ZERO && a->shift == 0
+        && fpj_fcvtz(s, (a->sf ? MO_64 : MO_32) | (is_signed ? MO_SIGN : 0),
+                     a->esz, cpu_reg(s, a->rd), a->rn)) {
+        return true;
     }
 
     tcg_int = cpu_reg(s, a->rd);
@@ -11265,6 +11585,7 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->nv2_mem_be = EX_TBFLAG_A64(tb_flags, NV2_MEM_BE);
     dc->fpcr_ah = EX_TBFLAG_A64(tb_flags, AH);
     dc->fpcr_nep = EX_TBFLAG_A64(tb_flags, NEP);
+    dc->fpj = !EX_TBFLAG_A64(tb_flags, FPSOFT) && arm_fpj_enabled();
     dc->gcs_en = EX_TBFLAG_A64(tb_flags, GCS_EN);
     dc->gcs_rvcen = EX_TBFLAG_A64(tb_flags, GCS_RVCEN);
     dc->gcsstr_el = EX_TBFLAG_A64(tb_flags, GCSSTR_EL);
