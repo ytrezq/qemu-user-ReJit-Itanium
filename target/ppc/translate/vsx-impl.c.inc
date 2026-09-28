@@ -1489,6 +1489,11 @@ static bool trans_XXPERM(DisasContext *ctx, arg_XX3 *a)
     REQUIRE_INSNS_FLAGS2(ctx, ISA300);
     REQUIRE_VSX(ctx);
 
+    /* vperm with vA = xA, vB = xT, vC = xB */
+    if (gen_perm2b_ppc(vsr_full_offset(a->xt), vsr_full_offset(a->xa),
+                       vsr_full_offset(a->xt), vsr_full_offset(a->xb), false)) {
+        return true;
+    }
     xt = gen_vsr_ptr(a->xt);
     xa = gen_vsr_ptr(a->xa);
     xb = gen_vsr_ptr(a->xb);
@@ -1504,6 +1509,11 @@ static bool trans_XXPERMR(DisasContext *ctx, arg_XX3 *a)
     REQUIRE_INSNS_FLAGS2(ctx, ISA300);
     REQUIRE_VSX(ctx);
 
+    /* vpermr with vA = xA, vB = xT, vC = xB */
+    if (gen_perm2b_ppc(vsr_full_offset(a->xt), vsr_full_offset(a->xa),
+                       vsr_full_offset(a->xt), vsr_full_offset(a->xb), true)) {
+        return true;
+    }
     xt = gen_vsr_ptr(a->xt);
     xa = gen_vsr_ptr(a->xa);
     xb = gen_vsr_ptr(a->xb);

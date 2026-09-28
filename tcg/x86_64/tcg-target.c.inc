@@ -1118,12 +1118,26 @@ static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret,
         tcg_out_vex_modrm_offset(s, OPC_MOVQ_VqWq, ret, 0, arg1, arg2);
         break;
     case TCG_TYPE_V128:
+        tcg_debug_assert(ret >= 16);
+        if (arg1 == TCG_AREG0) {
+            /*
+             * Front ends often write the halves of a vector register in
+             * env with separate 64-bit stores (e.g. PowerPC VSX loads):
+             * a 16-byte load of them would stall until they retire, as
+             * store forwarding cannot merge two stores.  Two 8-byte
+             * loads forward from either kind of store.
+             */
+            tcg_out_vex_modrm_offset(s, OPC_MOVQ_VqWq, ret, 0, arg1, arg2);
+            tcg_out_vex_modrm_offset(s, OPC_PINSRD | P_VEXW, ret, ret,
+                                     arg1, arg2 + 8);
+            tcg_out8(s, 1);
+            break;
+        }
         /*
          * The gvec infrastructure is asserts that v128 vector loads
          * and stores use a 16-byte aligned offset.  Validate that the
          * final pointer is aligned by using an insn that will SIGSEGV.
          */
-        tcg_debug_assert(ret >= 16);
         tcg_out_vex_modrm_offset(s, OPC_MOVDQA_VxWx, ret, 0, arg1, arg2);
         break;
     case TCG_TYPE_V256:

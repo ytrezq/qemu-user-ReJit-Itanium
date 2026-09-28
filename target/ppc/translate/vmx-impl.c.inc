@@ -1879,19 +1879,37 @@ TRANS(VINSERTH, do_vinsert_VX_uim4, 2, gen_helper_VINSHLX)
 TRANS(VINSERTW, do_vinsert_VX_uim4, 4, gen_helper_VINSWLX)
 TRANS(VINSERTD, do_vinsert_VX_uim4, 8, gen_helper_VINSDLX)
 
+/*
+ * vsldoi: bytes SH to SH + 15 of vA || vB, i.e. the high quadword of the
+ * 256-bit vA:vB shifted left by SH bytes: two funnel shifts.
+ */
 static void gen_vsldoi(DisasContext *ctx)
 {
-    TCGv_ptr ra, rb, rd;
-    TCGv_i32 sh;
+    int sh = VSH(ctx->opcode) & 0xf;
+    int q = sh >> 3, r = (sh & 7) * 8;
+    TCGv_i64 p[4], hi, lo;
+
     if (unlikely(!ctx->altivec_enabled)) {
         gen_exception(ctx, POWERPC_EXCP_VPU);
         return;
     }
-    ra = gen_avr_ptr(rA(ctx->opcode));
-    rb = gen_avr_ptr(rB(ctx->opcode));
-    rd = gen_avr_ptr(rD(ctx->opcode));
-    sh = tcg_constant_i32(VSH(ctx->opcode));
-    gen_helper_vsldoi(rd, ra, rb, sh);
+    /* doublewords of vA || vB, most significant first */
+    for (int i = 0; i < 3; i++) {
+        int reg = q + i < 2 ? rA(ctx->opcode) : rB(ctx->opcode);
+        p[i] = tcg_temp_new_i64();
+        get_avr64(p[i], reg, !((q + i) & 1));
+    }
+    hi = tcg_temp_new_i64();
+    lo = tcg_temp_new_i64();
+    if (r) {
+        tcg_gen_extract2_i64(hi, p[1], p[0], 64 - r);
+        tcg_gen_extract2_i64(lo, p[2], p[1], 64 - r);
+    } else {
+        tcg_gen_mov_i64(hi, p[0]);
+        tcg_gen_mov_i64(lo, p[1]);
+    }
+    set_avr64(rD(ctx->opcode), hi, true);
+    set_avr64(rD(ctx->opcode), lo, false);
 }
 
 static bool trans_VSLDBI(DisasContext *ctx, arg_VN *a)
@@ -2304,8 +2322,49 @@ TRANS_FLAGS2(ALTIVEC_207, VADDEUQM, do_va_helper, gen_helper_VADDEUQM)
 TRANS_FLAGS2(ALTIVEC_207, VSUBEUQM, do_va_helper, gen_helper_VSUBEUQM)
 TRANS_FLAGS2(ALTIVEC_207, VSUBECUQ, do_va_helper, gen_helper_VSUBECUQ)
 
-TRANS_FLAGS(ALTIVEC, VPERM, do_va_helper, gen_helper_VPERM)
-TRANS_FLAGS2(ISA300, VPERMR, do_va_helper, gen_helper_VPERMR)
+/*
+ * vperm, vpermr: one two-table byte permute (vpermi2b on x86).  With the
+ * host byte order of the registers, the table is vB then vA, and byte s
+ * of vA || vB is table entry 31 - s.
+ */
+static bool gen_perm2b_ppc(int t_ofs, int a_ofs, int b_ofs, int c_ofs,
+                           bool rev)
+{
+    TCGv_vec va, vb, vc, vt;
+
+    if (!tcg_can_emit_perm2b(TCG_TYPE_V128)) {
+        return false;
+    }
+    va = tcg_temp_new_vec(TCG_TYPE_V128);
+    vb = tcg_temp_new_vec(TCG_TYPE_V128);
+    vc = tcg_temp_new_vec(TCG_TYPE_V128);
+    vt = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(va, tcg_env, a_ofs);
+    tcg_gen_ld_vec(vb, tcg_env, b_ofs);
+    tcg_gen_ld_vec(vc, tcg_env, c_ofs);
+    if (!rev) {
+        /* 31 - s, only the low 5 bits count */
+        tcg_gen_xor_vec(MO_8, vc, vc, tcg_constant_vec(TCG_TYPE_V128, MO_8,
+                                                       0x1f));
+    }
+    tcg_gen_perm2b_vec(vt, vb, va, vc);
+    tcg_gen_st_vec(vt, tcg_env, t_ofs);
+    return true;
+}
+
+static bool do_vperm(DisasContext *ctx, arg_VA *a,
+    void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr), bool rev)
+{
+    REQUIRE_VECTOR(ctx);
+    if (gen_perm2b_ppc(avr_full_offset(a->vrt), avr_full_offset(a->vra),
+                       avr_full_offset(a->vrb), avr_full_offset(a->rc), rev)) {
+        return true;
+    }
+    return do_va_helper(ctx, a, gen_helper);
+}
+
+TRANS_FLAGS(ALTIVEC, VPERM, do_vperm, gen_helper_VPERM, false)
+TRANS_FLAGS2(ISA300, VPERMR, do_vperm, gen_helper_VPERMR, true)
 
 static void gen_vmladduhm_vec(unsigned vece, TCGv_vec t, TCGv_vec a, TCGv_vec b,
                               TCGv_vec c)
@@ -2628,7 +2687,55 @@ GEN_VXFORM_DUAL(vcipher, PPC_NONE, PPC2_ALTIVEC_207,
 GEN_VXFORM_DUAL(vncipher, PPC_NONE, PPC2_ALTIVEC_207,
                 vncipherlast, PPC_NONE, PPC2_ALTIVEC_207)
 
-#define VSHASIGMA(op)                         \
+/*
+ * The SHA-2 sigma functions with vector rotates: when all the elements use
+ * the same function (the SIX bits are all 0 or all 1), which is what SHA
+ * code does, this is five host instructions instead of a helper call.
+ */
+static bool gen_vshasigma_vec(DisasContext *ctx, unsigned vece)
+{
+    static const TCGOpcode vecop_list[] = {
+        INDEX_op_rotli_vec, INDEX_op_shri_vec, 0
+    };
+    /* [vece == MO_64][st][six]: rotates, then rotate (st) or shift */
+    static const uint8_t k[2][2][2][3] = {
+        { { { 7, 18, 3 }, { 17, 19, 10 } }, { { 2, 13, 22 }, { 6, 11, 25 } } },
+        { { { 1, 8, 7 }, { 19, 61, 6 } }, { { 28, 34, 39 }, { 14, 18, 41 } } },
+    };
+    int st_six = rB(ctx->opcode);
+    int st = (st_six >> 4) & 1;
+    /* SIX bits that matter: all four words, or doubleword bits 3 and 1 */
+    int used = vece == MO_32 ? 0xf : 0xa;
+    int six = st_six & used;
+    const uint8_t *c;
+    const TCGOpcode *hold;
+    TCGv_vec a, r, t;
+
+    if ((six != 0 && six != used) ||
+        !tcg_can_emit_vecop_list(vecop_list, TCG_TYPE_V128, vece)) {
+        return false;
+    }
+    c = k[vece == MO_64][st][six != 0];
+    hold = tcg_swap_vecop_list(vecop_list);
+    a = tcg_temp_new_vec(TCG_TYPE_V128);
+    r = tcg_temp_new_vec(TCG_TYPE_V128);
+    t = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(a, tcg_env, avr_full_offset(rA(ctx->opcode)));
+    tcg_gen_rotri_vec(vece, r, a, c[0]);
+    tcg_gen_rotri_vec(vece, t, a, c[1]);
+    tcg_gen_xor_vec(vece, r, r, t);
+    if (st) {
+        tcg_gen_rotri_vec(vece, t, a, c[2]);
+    } else {
+        tcg_gen_shri_vec(vece, t, a, c[2]);
+    }
+    tcg_gen_xor_vec(vece, r, r, t);
+    tcg_gen_st_vec(r, tcg_env, avr_full_offset(rD(ctx->opcode)));
+    tcg_swap_vecop_list(hold);
+    return true;
+}
+
+#define VSHASIGMA(op, vece)                   \
 static void gen_##op(DisasContext *ctx)       \
 {                                             \
     TCGv_ptr ra, rd;                          \
@@ -2637,14 +2744,17 @@ static void gen_##op(DisasContext *ctx)       \
         gen_exception(ctx, POWERPC_EXCP_VPU); \
         return;                               \
     }                                         \
+    if (gen_vshasigma_vec(ctx, vece)) {       \
+        return;                               \
+    }                                         \
     ra = gen_avr_ptr(rA(ctx->opcode));        \
     rd = gen_avr_ptr(rD(ctx->opcode));        \
     st_six = tcg_constant_i32(rB(ctx->opcode));  \
     gen_helper_##op(rd, ra, st_six);          \
 }
 
-VSHASIGMA(vshasigmaw)
-VSHASIGMA(vshasigmad)
+VSHASIGMA(vshasigmaw, MO_32)
+VSHASIGMA(vshasigmad, MO_64)
 
 GEN_VXFORM3(vpermxor, 22, 0xFF)
 GEN_VXFORM_DUAL(vsldoi, PPC_ALTIVEC, PPC_NONE,

@@ -409,6 +409,13 @@ void init_main_thread(CPUState *cs, struct image_info *info)
         env->gpr[12] = entry;  /* r12 set to global entry address */
     }
 
+    /*
+     * Linux keeps BHRB recording disabled (MMCRA[BHRBRD]) unless perf asks
+     * for it, which we do not emulate: avoid recording every branch.  The
+     * MSR store below recomputes hflags.
+     */
+    env->spr[SPR_POWER_MMCRA] |= MMCRA_BHRBRD;
+
     int flag = (env->insns_flags2 & PPC2_BOOKE206) ? MSR_CM : MSR_SF;
 #if defined(TARGET_ABI32)
     ppc_store_msr(env, env->msr & ~((target_ulong)1 << flag));

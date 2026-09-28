@@ -6566,7 +6566,12 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 #if defined(TARGET_PPC64)
     ctx->excp_model = env->excp_model;
     ctx->sf_mode = (hflags >> HFLAGS_64) & 1;
+#ifdef CONFIG_USER_ONLY
+    /* CFAR is only readable in privileged state */
+    ctx->has_cfar = false;
+#else
     ctx->has_cfar = !!(env->flags & POWERPC_FLAG_CFAR);
+#endif
     ctx->has_bhrb = !!(env->flags & POWERPC_FLAG_BHRB);
 #endif
     ctx->lazy_tlb_flush = env->mmu_model == POWERPC_MMU_32B
