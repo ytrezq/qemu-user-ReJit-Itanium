@@ -2501,6 +2501,9 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fpop2_vec:
     case INDEX_op_fpop3_vec:
     case INDEX_op_fpcmpcc_vec:
+    case INDEX_op_fpop1_i64:
+    case INDEX_op_fpop2_i64:
+    case INDEX_op_fpop3_i64:
     case INDEX_op_ld32_vec:
     case INDEX_op_st32_vec:
         return has_type && TCG_TARGET_HAS_fpop_vec;
@@ -2509,6 +2512,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_crypto_vec:
         return has_type && TCG_TARGET_HAS_crypto_vec;
     case INDEX_op_ldm_vec:
+    case INDEX_op_ldmm_vec:
     case INDEX_op_stm_vec:
         return has_type && TCG_TARGET_HAS_ldstm_vec;
 

@@ -21,6 +21,12 @@
 #define FPX_S2          18
 #define FPX_S3          19
 
+/* The operands of the fpop*_i64 ops, around the fpop code proper */
+#define FPX_I0          20
+#define FPX_I1          21
+#define FPX_I2          22
+#define FPX_I3          23
+
 /* Opmask registers */
 #define FPK1            1
 #define FPK2            2
@@ -116,6 +122,12 @@
 #define FPO_MOVDQU8_LD  (0x6f | P_EXT | P_SIMDF2)
 #define FPO_MOVDQU8_ST  (0x7f | P_EXT | P_SIMDF2)
 #define FPO_KMOVW_KR    (0x92 | P_EXT)
+#define FPO_KMOVD_KR    (0x92 | P_EXT | P_SIMDF2)
+#define FPO_KMOVB_RK    (0x93 | P_EXT | P_DATA16)       /* kmovb r32, k */
+#define FPO_MOVQ_XR     (0x6e | P_EXT | P_DATA16 | P_VEXW)  /* vmovq x, r64 */
+#define FPO_MOVQ_RX     (0x7e | P_EXT | P_DATA16 | P_VEXW)  /* vmovq r64, x */
+#define FPO_MOVD_RX     (0x7e | P_EXT | P_DATA16)           /* vmovd r32, x */
+#define FPO_KMOVQ_KR    (0x92 | P_EXT | P_SIMDF2 | P_VEXW)
 
 /* Opmask instructions, VEX-encoded */
 #define FPO_KANDB       (0x41 | P_EXT | P_DATA16 | P_VEXL)
@@ -137,6 +149,8 @@ static const uint8_t fpo_cmp_pred[][2] = {
     [TCG_FPPRED_LTGT]  = { 0x0c, 0x1c },  /* NEQ_OQ, NEQ_OS */
 };
 #define FPO_PRED_UNORD_Q    0x03
+#define FPO_PRED_NLT_UQ     0x15
+#define FPO_PRED_LT_OQ      0x11
 #define FPO_PRED_UNORD_S    0x13
 #define FPO_PRED_ORD_Q      0x07
 #define FPO_PRED_NEQ_OQ     0x0c
@@ -391,6 +405,25 @@ static void fpo_fma_imz(TCGContext *s, const int *in, bool scalar, bool dbl,
     fpo_kop(s, FPO_KANDB, FPK2, FPK2, FPK3);
     /* signalling compare of that NaN: invalid, and only that */
     fpo_rrri(s, cmp, FPK3, FPX_S3, FPX_S3, FPK2, false, FPO_PRED_UNORD_S);
+}
+
+/*
+ * TCG_FPOP_F_RISCV: a NaN result is the default NaN, and for FMA
+ * (@fma_in = a, b, c) 0 * inf + a quiet NaN signals invalid as well.
+ * Scalars only; the other lanes get the default NaN too.
+ */
+static void fpo_nan_canon(TCGContext *s, int d, bool dbl, const int *fma_in)
+{
+    uint8_t *done;
+
+    /* common case: not a NaN */
+    fpo_rrr(s, dbl ? FPO_UCOMISD : FPO_UCOMISS, d, 0, d, 0, false);
+    done = fpo_jcc32(s, JCC_JNP);
+    if (fma_in) {
+        fpo_fma_imz(s, fma_in, true, dbl, 0);
+    }
+    fpo_ldc(s, d, dbl, dbl ? 0x7ff8000000000000ull : 0x7fc00000u);
+    fpo_patch32(s, done);
 }
 
 /*
@@ -667,6 +700,31 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
         return;
     case TCG_FPOP_MAXNUM:
     case TCG_FPOP_MINNUM:
+        if (fpop & TCG_FPOP_F_RISCV) {
+            /*
+             * vrange orders -0 < +0 and signals for signalling NaNs; then
+             * a NaN loses against the other operand, and two NaNs give
+             * the default NaN.
+             */
+            int range = (FPO_RANGEP + 1) | (dbl ? P_VEXW : 0);
+            int blend = dbl ? FPO_PBLENDMQ : FPO_PBLENDMD;
+            bool max = TCG_FPOP_OP(fpop) == TCG_FPOP_MAXNUM;
+            uint8_t *done;
+
+            tcg_debug_assert(scalar);
+            fpo_rrri(s, range, d, a, b, 0, false, max ? 0x05 : 0x04);
+            fpo_class(s, FPK1, a, true, dbl, FPO_CLS_NAN);
+            fpo_class(s, FPK2, b, true, dbl, FPO_CLS_NAN);
+            tcg_out_vex_modrm(s, FPO_KORTESTB, FPK1, 0, FPK2);
+            done = fpo_jcc32(s, JCC_JE);
+            fpo_rrr(s, blend, d, d, b, FPK1, false);
+            fpo_rrr(s, blend, d, d, a, FPK2, false);
+            fpo_kop(s, FPO_KANDB, FPK3, FPK1, FPK2);
+            fpo_ldc_k(s, d, dbl, dbl ? 0x7ff8000000000000ull : 0x7fc00000u,
+                      FPK3);
+            fpo_patch32(s, done);
+            return;
+        }
         {
             /*
              * vrange orders -0 < +0 (sign from the selected operand); NaNs
@@ -755,6 +813,11 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
 
     opc |= pfx;
     fpo_rrr(s, opc, d, a, b, 0, false);
+    if (fpop & TCG_FPOP_F_RISCV) {
+        /* tininess after rounding: nothing else to do */
+        fpo_nan_canon(s, d, dbl, NULL);
+        return;
+    }
     if (fpop & TCG_FPOP_F_SNAN_FIRST) {
         fpo_fix_nan_arm(s, d, in, 2, scalar, dbl);
     } else if (fpop & TCG_FPOP_F_DEFNAN) {
@@ -801,6 +864,10 @@ static void tcg_out_fpop3(TCGContext *s, TCGType type, unsigned vece,
         r = FPX_S1;
     }
 
+    if (fpop & TCG_FPOP_F_RISCV) {
+        fpo_nan_canon(s, d, dbl, in);
+        return;
+    }
     if (fpop & TCG_FPOP_F_NEG_RES) {
         /* -(x) for the non-NaN results only */
         int cmp = FPO_CMP | fpo_pfx(scalar, dbl);
@@ -826,7 +893,7 @@ static void tcg_out_fpop3(TCGContext *s, TCGType type, unsigned vece,
 /* PowerPC saturation of fp -> int conversions, see TCG_FPOP_F_PPC_SAT */
 static void fpo_cvti_sat(TCGContext *s, int d, int a, bool scalar,
                          bool dbl_src, bool sgn, unsigned ibits, int kl,
-                         bool trunc)
+                         bool trunc, bool riscv)
 {
     int cmp = FPO_CMP | fpo_pfx(scalar, dbl_src);
     bool q = ibits == 64;
@@ -842,12 +909,19 @@ static void fpo_cvti_sat(TCGContext *s, int d, int a, bool scalar,
                          : trunc ? 0x41e0000000000000ull
                          : 0x41dfffffffe00000ull)
                       : (ibits == 64 ? 0x5f000000u : 0x4f000000u);
-        fpo_rrci(s, cmp, FPK2, a, kl, lim, FPO_PRED_GE_OQ, !scalar);
+        /* RISC-V: a NaN saturates as well */
+        fpo_rrci(s, cmp, FPK2, a, kl, lim,
+                 riscv ? FPO_PRED_NLT_UQ : FPO_PRED_GE_OQ, !scalar);
         fpo_rrc(s, q ? FPO_PBLENDMQ : FPO_PBLENDMD, d, d, FPK2, false,
                 q ? INT64_MAX : INT32_MAX);
     } else {
-        /* NaN, negative (overflow) give all-ones on x86: they become 0 */
-        fpo_rrci(s, cmp, FPK2, a, kl, 0, FPO_PRED_NGT_UQ, !scalar);
+        /*
+         * NaN, negative (overflow) give all-ones on x86: they become 0,
+         * except a NaN for RISC-V (the maximum); a negative number that
+         * rounds to 0 gives 0 anyway.
+         */
+        fpo_rrci(s, cmp, FPK2, a, kl, 0,
+                 riscv ? FPO_PRED_LT_OQ : FPO_PRED_NGT_UQ, !scalar);
         fpo_rrc(s, q ? FPO_PBLENDMQ : FPO_PBLENDMD, d, d, FPK2, false, 0);
     }
 }
@@ -892,7 +966,8 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
     bool scalar = type == TCG_TYPE_V64;
     bool dbl = vece == MO_64;
     bool trunc = fpop & TCG_FPOP_F_TRUNC;
-    bool sat = fpop & TCG_FPOP_F_PPC_SAT;
+    bool riscv = fpop & TCG_FPOP_F_RISCV;
+    bool sat = (fpop & TCG_FPOP_F_PPC_SAT) || riscv;
     int pfx = fpo_pfx(scalar, dbl);
     int kl = 0;
     int opc;
@@ -900,6 +975,10 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
     switch (TCG_FPOP_OP(fpop)) {
     case TCG_FPOP_SQRT:
         fpo_rrr(s, FPO_SQRT | pfx, d, scalar ? a : 0, a, 0, false);
+        if (riscv) {
+            fpo_nan_canon(s, d, dbl, NULL);
+            return;
+        }
         if (fpop & TCG_FPOP_F_SNAN_FIRST) {
             fpo_fix_nan_arm(s, d, &a, 1, scalar, dbl);
         } else if (fpop & TCG_FPOP_F_DEFNAN) {
@@ -1014,7 +1093,7 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
             fpo_rrr(s, opc, d, 0, a, kl, kl != 0);
             if (sat) {
                 fpo_cvti_sat(s, d, a, scalar, dbl, !u, dbl ? 64 : 32, kl,
-                             trunc);
+                             trunc, riscv);
             }
             if ((fpop & TCG_FPOP_F_NAN_ZERO) && !u) {
                 fpo_cvti_nan_zero(s, d, a, scalar, dbl, dbl, kl);
@@ -1033,7 +1112,7 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
                     : (trunc ? FPO_CVTTPS2QQ : FPO_CVTPS2QQ);
             fpo_rrr(s, opc, d, 0, a, kl, true);
             if (sat) {
-                fpo_cvti_sat(s, d, a, true, false, !u, 64, kl, trunc);
+                fpo_cvti_sat(s, d, a, true, false, !u, 64, kl, trunc, riscv);
             }
             if ((fpop & TCG_FPOP_F_NAN_ZERO) && !u) {
                 fpo_cvti_nan_zero(s, d, a, true, false, true, kl);
@@ -1045,12 +1124,19 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
         /* exact; a signalling NaN is quieted, with invalid */
         tcg_debug_assert(scalar && !dbl);
         fpo_rrr(s, FPO_CVTSS2SD, d, a, a, 0, false);
+        if (riscv) {
+            fpo_nan_canon(s, d, true, NULL);
+        }
         return;
 
     case TCG_FPOP_CVT_F32:
         tcg_debug_assert(scalar && dbl);
         fpo_rrr(s, FPO_CVTSD2SS, d, a, a, 0, false);
-        fpo_tiny_cvt(s, d, a);
+        if (riscv) {
+            fpo_nan_canon(s, d, false, NULL);
+        } else {
+            fpo_tiny_cvt(s, d, a);
+        }
         return;
 
     case TCG_FPOP_CVTI_S32:
@@ -1064,7 +1150,7 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
                     : (trunc ? FPO_CVTTPD2DQ : FPO_CVTPD2DQ);
             fpo_rrr(s, opc, d, 0, a, kl, true);
             if (sat) {
-                fpo_cvti_sat(s, d, a, true, true, !u, 32, kl, trunc);
+                fpo_cvti_sat(s, d, a, true, true, !u, 32, kl, trunc, riscv);
             }
             if (fpop & TCG_FPOP_F_DUP32) {
                 /* vpshufd d, d, 0: dword 0 everywhere */
@@ -1075,7 +1161,7 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
                 fpo_cvti_nan_zero(s, d, a, true, true, false, kl);
             }
             fpo_rrr(s, u ? FPO_PMOVZXDQ : FPO_PMOVSXDQ, d, 0, d, 0, false);
-            if (sat && !u && !(fpop & TCG_FPOP_F_NAN_ZERO)) {
+            if (sat && !u && !riscv && !(fpop & TCG_FPOP_F_NAN_ZERO)) {
                 /* PowerPC: a NaN gives 0x0000000080000000 */
                 fpo_rrri(s, FPO_CMP | fpo_pfx(true, true), FPK2, a, a,
                          0, false, FPO_PRED_UNORD_Q);
@@ -1135,6 +1221,28 @@ static bool tcg_target_can_emit_fpop(unsigned fpop, TCGType type,
     if ((fpop & TCG_FPOP_F_SP) && (vece != MO_64 || !scalar)) {
         /* rounded to odd with scalar ops only */
         return false;
+    }
+    if (fpop & TCG_FPOP_F_RISCV) {
+        if (!scalar || (fpop & (TCG_FPOP_F_DEFNAN | TCG_FPOP_F_SP |
+                                TCG_FPOP_F_NAN_ACB | TCG_FPOP_F_NEG_RES |
+                                TCG_FPOP_F_PPC_SAT | TCG_FPOP_F_DUP32 |
+                                TCG_FPOP_F_SNAN_FIRST |
+                                TCG_FPOP_F_NAN_ZERO))) {
+            return false;
+        }
+        switch (TCG_FPOP_OP(fpop)) {
+        case TCG_FPOP_MAXC:
+        case TCG_FPOP_MINC:
+        case TCG_FPOP_MAX:
+        case TCG_FPOP_MIN:
+        case TCG_FPOP_RECIP:
+        case TCG_FPOP_RSQRT:
+        case TCG_FPOP_RINT:
+        case TCG_FPOP_RND_SP:
+            return false;
+        default:
+            break;
+        }
     }
 
     switch (TCG_FPOP_OP(fpop)) {
@@ -1289,6 +1397,94 @@ static bool fpo_res32(unsigned vece, unsigned fpop)
     }
 }
 
+/*
+ * k1 = mask register @r, one bit per element of @type and size @vece:
+ * kmovw when 16 bits are enough, else kmovd or kmovq.
+ */
+static void fpo_kmov_elems(TCGContext *s, TCGType type, unsigned vece,
+                           TCGReg r)
+{
+    int bits = (8 << (type - TCG_TYPE_V64)) >> vece;
+    int opc = bits <= 16 ? FPO_KMOVW_KR : bits <= 32 ? FPO_KMOVD_KR
+                                                     : FPO_KMOVQ_KR;
+
+    tcg_out_vex_modrm(s, opc, FPK1, 0, r);
+}
+
+/* vmovdqu8/16/32/64 load or store for the vector length of @type */
+static int fpo_movdqu(TCGType type, unsigned vece, bool store)
+{
+    int opc = store ? FPO_MOVDQU8_ST : FPO_MOVDQU8_LD;
+
+    if (vece >= MO_32) {
+        opc ^= P_SIMDF2 | P_SIMDF3;
+    }
+    if (vece & 1) {
+        opc |= P_VEXW;
+    }
+    if (type == TCG_TYPE_V256) {
+        opc |= P_VEXL;
+    }
+    return opc;
+}
+
+/* vmovq/vmovd between xmm @x (0-31) and the general register @r */
+static void fpo_mov_xr(TCGContext *s, int opc, int x, TCGReg r)
+{
+    fpo_evex_opc(s, opc, x, 0, r, true, 0, false, false);
+    tcg_out8(s, 0xc0 | ((x & 7) << 3) | (r & 7));
+}
+
+/*
+ * fpop*_i64: the operands go to xmm21-23 (once each), the fpop code
+ * computes xmm20, which goes back to a general register; a compare
+ * leaves its opmask bit there instead.
+ */
+static void tcg_out_fpop_i64(TCGContext *s, TCGOpcode opc, unsigned vece,
+                             const TCGArg *args)
+{
+    int nin = opc == INDEX_op_fpop1_i64 ? 1 : opc == INDEX_op_fpop2_i64 ? 2
+                                                                        : 3;
+    unsigned fpop = args[nin + 1];
+    int x[3];
+
+    for (int i = 0; i < nin; i++) {
+        x[i] = FPX_I1 + i;
+        for (int j = 0; j < i; j++) {
+            if (args[1 + j] == args[1 + i]) {
+                x[i] = x[j];
+                break;
+            }
+        }
+        if (x[i] == FPX_I1 + i) {
+            fpo_mov_xr(s, FPO_MOVQ_XR, x[i], args[1 + i]);
+        }
+    }
+
+    switch (nin) {
+    case 1:
+        tcg_out_fpop1(s, TCG_TYPE_V64, vece, FPX_I0, x[0], fpop);
+        break;
+    case 2:
+        if (TCG_FPOP_OP(fpop) == TCG_FPOP_CMP) {
+            unsigned pred = TCG_FPOP_GET_PRED(fpop);
+            bool sig = fpop & TCG_FPOP_F_SIGNAL;
+
+            fpo_rrri(s, FPO_CMP | fpo_pfx(true, vece == MO_64), FPK1,
+                     x[0], x[1], 0, false, fpo_cmp_pred[pred][sig]);
+            tcg_out_vex_modrm(s, FPO_KMOVB_RK, args[0], 0, FPK1);
+            return;
+        }
+        tcg_out_fpop2(s, TCG_TYPE_V64, vece, FPX_I0, x[0], x[1], fpop);
+        break;
+    default:
+        tcg_out_fpop3(s, TCG_TYPE_V64, vece, FPX_I0, x[0], x[1], x[2], fpop);
+        break;
+    }
+    fpo_mov_xr(s, fpo_res32(vece, fpop) ? FPO_MOVD_RX : FPO_MOVQ_RX,
+               FPX_I0, args[0]);
+}
+
 /* Dispatch from tcg_out_vec_op(); returns false if @opc is not ours. */
 static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
                              unsigned vece, const TCGArg *args)
@@ -1318,10 +1514,22 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
         tcg_out_fpcmpcc(s, vece, args[0], FPX(args[1]), FPX(args[2]),
                         args[3]);
         return true;
+    case INDEX_op_fpop1_i64:
+    case INDEX_op_fpop2_i64:
+    case INDEX_op_fpop3_i64:
+        tcg_out_fpop_i64(s, opc, vece, args);
+        return true;
     case INDEX_op_ldm_vec:
-        /* vmovdqu8 d{k1}{z}, [ptr]: masked-off bytes do not fault */
-        tcg_out_vex_modrm(s, FPO_KMOVW_KR, FPK1, 0, args[2]);
-        fpo_rm_base(s, FPO_MOVDQU8_LD, FPX(args[0]), args[1], FPK1, true);
+        /* vmovdqu<e> d{k1}{z}, [ptr]: masked-off elements do not fault */
+        fpo_kmov_elems(s, type, vece, args[2]);
+        fpo_rm_base(s, fpo_movdqu(type, vece, false), FPX(args[0]), args[1],
+                    FPK1, true);
+        return true;
+    case INDEX_op_ldmm_vec:
+        /* vmovdqu<e> d{k1}, [ptr] with d == old: merging */
+        fpo_kmov_elems(s, type, vece, args[3]);
+        fpo_rm_base(s, fpo_movdqu(type, vece, false), FPX(args[0]), args[2],
+                    FPK1, false);
         return true;
     case INDEX_op_crypto_vec:
         tcg_out_crypto(s, FPX(args[0]), FPX(args[1]), FPX(args[2]),
@@ -1338,8 +1546,9 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
                                  args[2]);
         return true;
     case INDEX_op_stm_vec:
-        tcg_out_vex_modrm(s, FPO_KMOVW_KR, FPK1, 0, args[2]);
-        fpo_rm_base(s, FPO_MOVDQU8_ST, FPX(args[0]), args[1], FPK1, false);
+        fpo_kmov_elems(s, type, vece, args[2]);
+        fpo_rm_base(s, fpo_movdqu(type, vece, true), FPX(args[0]), args[1],
+                    FPK1, false);
         return true;
     case INDEX_op_perm2b_vec:
         /* d = idx, then d = (a:b)[d] */

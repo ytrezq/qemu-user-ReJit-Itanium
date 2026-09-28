@@ -184,18 +184,25 @@ DEF(fpop2_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(fpop3_vec, 1, 3, 1, TCG_OPF_VECTOR)
 /* i32 output with a TCG_FPCC_* bit: compare of the scalar elements. */
 DEF(fpcmpcc_vec, 1, 2, 1, TCG_OPF_VECTOR)
+/* the same on i64 temps (TCG_TYPE_V64 scalars), see tcg-fpop.h */
+DEF(fpop1_i64, 1, 1, 1, TCG_OPF_VECTOR)
+DEF(fpop2_i64, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(fpop3_i64, 1, 3, 1, TCG_OPF_VECTOR)
 /*
  * Byte permute of the 32-byte concatenation a:b (a supplies bytes 0-15),
  * d[i] = (a:b)[idx[i] & 31], in host element order.
  */
 DEF(perm2b_vec, 1, 3, 0, TCG_OPF_VECTOR)
 /*
- * Masked access to host memory, for user-mode guest accesses: the bytes
- * of the vector whose bit is set in the i64 mask (bit i for byte i, in
- * host order) are loaded from or stored to ptr + i, and a load zeroes the
- * others.  Bytes outside the mask are not accessed, so they cannot fault.
+ * Masked access to host memory, for user-mode guest accesses: the elements
+ * of size vece of the vector whose bit is set in the i64 mask (bit i for
+ * element i, in host order) are loaded from or stored to ptr + (i << vece);
+ * ldm_vec zeroes the others and ldmm_vec (d = ldmm(old, ptr, mask)) keeps
+ * those of old.  Elements outside the mask are not accessed, so they cannot
+ * fault.
  */
 DEF(ldm_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_SIDE_EFFECTS)
+DEF(ldmm_vec, 1, 3, 0, TCG_OPF_VECTOR | TCG_OPF_SIDE_EFFECTS)
 DEF(stm_vec, 0, 3, 0, TCG_OPF_VECTOR | TCG_OPF_SIDE_EFFECTS)
 /* hash steps, see tcg-crypto.h */
 DEF(crypto_vec, 1, 3, 1, TCG_OPF_VECTOR)

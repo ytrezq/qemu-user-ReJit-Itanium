@@ -875,6 +875,37 @@ void tcg_gen_fpop3_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
     op->args[4] = fpop;
 }
 
+void tcg_gen_fpop1_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, unsigned fpop)
+{
+    tcg_debug_assert(tcg_can_emit_fpop(fpop, TCG_TYPE_V64, vece));
+    vec_gen_3(INDEX_op_fpop1_i64, TCG_TYPE_V64, vece, tcgv_i64_arg(r),
+              tcgv_i64_arg(a), fpop);
+}
+
+void tcg_gen_fpop2_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, TCGv_i64 b,
+                       unsigned fpop)
+{
+    tcg_debug_assert(tcg_can_emit_fpop(fpop, TCG_TYPE_V64, vece));
+    vec_gen_4(INDEX_op_fpop2_i64, TCG_TYPE_V64, vece, tcgv_i64_arg(r),
+              tcgv_i64_arg(a), tcgv_i64_arg(b), fpop);
+}
+
+void tcg_gen_fpop3_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, TCGv_i64 b,
+                       TCGv_i64 c, unsigned fpop)
+{
+    TCGOp *op;
+
+    tcg_debug_assert(tcg_can_emit_fpop(fpop, TCG_TYPE_V64, vece));
+    op = tcg_emit_op(INDEX_op_fpop3_i64, 5);
+    TCGOP_TYPE(op) = TCG_TYPE_V64;
+    TCGOP_VECE(op) = vece;
+    op->args[0] = tcgv_i64_arg(r);
+    op->args[1] = tcgv_i64_arg(a);
+    op->args[2] = tcgv_i64_arg(b);
+    op->args[3] = tcgv_i64_arg(c);
+    op->args[4] = fpop;
+}
+
 void tcg_gen_fpcmpcc_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
                          unsigned fpop)
 {
@@ -900,6 +931,28 @@ void tcg_gen_stm_vec(TCGv_vec v, TCGv_ptr ptr, TCGv_i64 mask)
 
     tcg_debug_assert(tcg_can_emit_ldstm(vt->base_type));
     vec_gen_3(INDEX_op_stm_vec, vt->base_type, MO_8, temp_arg(vt),
+              tcgv_ptr_arg(ptr), tcgv_i64_arg(mask));
+}
+
+void tcg_gen_ldm_merge_vec(unsigned vece, TCGv_vec r, TCGv_vec old,
+                           TCGv_ptr ptr, TCGv_i64 mask)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGTemp *ot = tcgv_vec_temp(old);
+
+    tcg_debug_assert(ot->base_type == rt->base_type);
+    tcg_debug_assert(tcg_can_emit_ldstm(rt->base_type));
+    vec_gen_4(INDEX_op_ldmm_vec, rt->base_type, vece, temp_arg(rt),
+              temp_arg(ot), tcgv_ptr_arg(ptr), tcgv_i64_arg(mask));
+}
+
+void tcg_gen_stm_elem_vec(unsigned vece, TCGv_vec v, TCGv_ptr ptr,
+                          TCGv_i64 mask)
+{
+    TCGTemp *vt = tcgv_vec_temp(v);
+
+    tcg_debug_assert(tcg_can_emit_ldstm(vt->base_type));
+    vec_gen_3(INDEX_op_stm_vec, vt->base_type, vece, temp_arg(vt),
               tcgv_ptr_arg(ptr), tcgv_i64_arg(mask));
 }
 

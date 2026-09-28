@@ -523,9 +523,22 @@ void tcg_gen_fpop3_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
                        TCGv_vec c, unsigned fpop);
 void tcg_gen_fpcmpcc_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
                          unsigned fpop);
+void tcg_gen_fpop1_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, unsigned fpop);
+void tcg_gen_fpop2_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, TCGv_i64 b,
+                       unsigned fpop);
+void tcg_gen_fpop3_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, TCGv_i64 b,
+                       TCGv_i64 c, unsigned fpop);
 void tcg_gen_perm2b_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx);
 void tcg_gen_ldm_vec(TCGv_vec r, TCGv_ptr ptr, TCGv_i64 mask);
 void tcg_gen_stm_vec(TCGv_vec v, TCGv_ptr ptr, TCGv_i64 mask);
+/*
+ * The same with one mask bit per element of size @vece; the load keeps
+ * the elements of @old whose bit is clear.
+ */
+void tcg_gen_ldm_merge_vec(unsigned vece, TCGv_vec r, TCGv_vec old,
+                           TCGv_ptr ptr, TCGv_i64 mask);
+void tcg_gen_stm_elem_vec(unsigned vece, TCGv_vec v, TCGv_ptr ptr,
+                          TCGv_i64 mask);
 void tcg_gen_st32_vec(TCGv_vec r, TCGv_ptr b, TCGArg o);
 void tcg_gen_ld32_vec(TCGv_vec r, TCGv_ptr b, TCGArg o);
 void tcg_gen_crypto_vec(unsigned op, TCGv_vec r, TCGv_vec a, TCGv_vec b,

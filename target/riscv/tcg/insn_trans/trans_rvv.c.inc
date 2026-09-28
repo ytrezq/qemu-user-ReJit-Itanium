@@ -846,6 +846,117 @@ static bool ldst_us_trans(uint32_t vd, uint32_t rs1, uint32_t data,
     return true;
 }
 
+#ifdef CONFIG_USER_ONLY
+/*
+ * vle<eew>.v and vse<eew>.v without segments and from vstart 0, as one
+ * masked host access per register of the group (vmovdqu<eew> with an
+ * AVX-512 opmask): the elements past vl, or whose v0 bit is clear, are
+ * neither accessed (so they cannot fault) nor changed, which is what tail
+ * and mask undisturbed ask.  A fault leaves vstart at 0, the registers of
+ * the group before the faulting one possibly written.
+ */
+static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
+                           bool is_store)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+    int emul = eew - s->sew + s->lmul;
+    int nregs = emul > 0 ? 1 << emul : 1;
+    uint32_t n = vlenb >> eew;                  /* elements per register */
+    uint32_t vlmax = emul < 0 ? n >> -emul : n << emul;
+    TCGType type = vlenb == 32 ? TCG_TYPE_V256 : TCG_TYPE_V128;
+    TCGv_i32 lo = NULL;
+    int r;
+
+    if ((vlenb != 16 && vlenb != 32) || a->nf != 1 || !s->vstart_eq_zero
+        || !tcg_can_emit_ldstm(type)
+        || (!is_store && (s->vta || (!a->vm && s->vma)))) {
+        return false;
+    }
+
+    if (is_store && s->ztso) {
+        tcg_gen_mb(TCG_MO_LD_ST | TCG_MO_ST_ST | TCG_BAR_STRL);
+    }
+    mark_vs_dirty(s);
+
+    for (r = 0; r < nregs; r++) {
+        TCGv addr = get_address(s, a->rs1, r * vlenb);
+        TCGv_ptr host = tcg_temp_new_ptr();
+        TCGv_vec v = tcg_temp_new_vec(type);
+        uint32_t ofs = vreg_ofs(s, a->rd + r);
+        TCGv_i64 mask = NULL;
+
+        tcg_gen_addi_tl(addr, addr, guest_base);
+        tcg_gen_trunc_i64_ptr(host, addr);
+
+        /* the elements r * n to r * n + n - 1 of the group */
+        if (!s->vl_eq_vlmax) {
+            TCGv_i32 hi = tcg_temp_new_i32();
+            TCGv_i32 cnt = hi;
+
+            /* cnt = min(vl, (r + 1) * n) - min(vl, r * n) */
+            tcg_gen_umin_i32(hi, cpu_vl,
+                             tcg_constant_i32(MIN((r + 1) * n, vlmax)));
+            if (lo) {
+                cnt = tcg_temp_new_i32();
+                tcg_gen_sub_i32(cnt, hi, lo);
+            }
+            lo = hi;
+            mask = tcg_temp_new_i64();
+            tcg_gen_extu_i32_i64(mask, cnt);
+            tcg_gen_shl_i64(mask, tcg_constant_i64(1), mask);
+            tcg_gen_subi_i64(mask, mask, 1);
+        } else if (vlmax < n) {
+            mask = tcg_constant_i64(MAKE_64BIT_MASK(0, vlmax));
+        }
+        if (!a->vm) {
+            uint32_t bit = r * n;
+            TCGv_i64 m0 = tcg_temp_new_i64();
+
+            /* n divides 64: the bits of a register are in one word */
+            tcg_gen_ld_i64(m0, tcg_env, vreg_ofs(s, 0) + bit / 64 * 8);
+            tcg_gen_shri_i64(m0, m0, bit % 64);
+            if (mask) {
+                tcg_gen_and_i64(m0, m0, mask);
+            }
+            mask = m0;
+        }
+
+        /*
+         * Masked moves even for a whole register: they do not require
+         * the alignment that ld_vec and st_vec may assume.
+         */
+        if (is_store) {
+            tcg_gen_ld_vec(v, tcg_env, ofs);
+            if (mask) {
+                tcg_gen_stm_elem_vec(eew, v, host, mask);
+            } else {
+                tcg_gen_stm_vec(v, host, tcg_constant_i64(-1));
+            }
+        } else {
+            if (mask) {
+                tcg_gen_ld_vec(v, tcg_env, ofs);
+                tcg_gen_ldm_merge_vec(eew, v, v, host, mask);
+            } else {
+                tcg_gen_ldm_vec(v, host, tcg_constant_i64(-1));
+            }
+            tcg_gen_st_vec(v, tcg_env, ofs);
+        }
+    }
+
+    if (!is_store && s->ztso) {
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_LDAQ);
+    }
+    finalize_rvv_inst(s);
+    return true;
+}
+#else
+static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
+                           bool is_store)
+{
+    return false;
+}
+#endif
+
 static bool ld_us_op(DisasContext *s, arg_r2nfvm *a, uint8_t eew)
 {
     uint32_t data = 0;
@@ -862,6 +973,9 @@ static bool ld_us_op(DisasContext *s, arg_r2nfvm *a, uint8_t eew)
     fn =  fns[a->vm][eew];
     if (fn == NULL) {
         return false;
+    }
+    if (ldst_us_inline(s, a, eew, false)) {
+        return true;
     }
 
     /*
@@ -906,6 +1020,9 @@ static bool st_us_op(DisasContext *s, arg_r2nfvm *a, uint8_t eew)
     fn =  fns[a->vm][eew];
     if (fn == NULL) {
         return false;
+    }
+    if (ldst_us_inline(s, a, eew, true)) {
+        return true;
     }
 
     uint8_t emul = vext_get_emul(s, eew);

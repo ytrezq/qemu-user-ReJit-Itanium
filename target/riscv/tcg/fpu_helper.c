@@ -22,10 +22,63 @@
 #include "exec/helper-proto.h"
 #include "fpu/softfloat.h"
 #include "internals.h"
+#include "tcg/tcg.h"
+#include "tcg/tcg-fpop.h"
+
+/*
+ * F and D instructions in host FP code (user mode, see trans_rvf.c.inc)
+ * leave their exception flags in the host FP status register, which
+ * belongs to the thread of this CPU: they are part of fflags, cleared by
+ * riscv_cpu_set_fflags() and folded into fp_status by riscv_fpj_sync().
+ */
+bool riscv_fpj_enabled(void)
+{
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *e = getenv("QEMU_RISCV_FPJIT");
+
+        enabled = !(e && e[0] == '0')
+                  && tcg_can_emit_fpop(TCG_FPOP_ADD | TCG_FPOP_F_RISCV,
+                                       TCG_TYPE_V64, MO_64);
+    }
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+static int riscv_fpj_host_flags(void)
+{
+    unsigned h;
+
+    if (!riscv_fpj_enabled()) {
+        return 0;
+    }
+    h = tcg_host_fpexc_get();
+    return (h & TCG_FPEXC_INEXACT ? float_flag_inexact : 0)
+         | (h & TCG_FPEXC_UNDERFLOW ? float_flag_underflow : 0)
+         | (h & TCG_FPEXC_OVERFLOW ? float_flag_overflow : 0)
+         | (h & TCG_FPEXC_DIVZERO ? float_flag_divbyzero : 0)
+         | (h & TCG_FPEXC_INVALID ? float_flag_invalid : 0);
+}
+
+/* Fold the host flags into fp_status and clear them (before a syscall) */
+void riscv_fpj_sync(CPURISCVState *env)
+{
+    int f = riscv_fpj_host_flags();
+
+    if (f) {
+        float_raise(f, &env->fp_status);
+        tcg_host_fpexc_clear();
+    }
+}
 
 uint8_t riscv_cpu_get_fflags(CPURISCVState *env)
 {
-    int soft = get_float_exception_flags(&env->fp_status);
+    int soft = get_float_exception_flags(&env->fp_status)
+               | riscv_fpj_host_flags();
     uint8_t hard = 0;
 
     hard |= (soft & float_flag_inexact) ? FPEXC_NX : 0;
@@ -48,6 +101,9 @@ void riscv_cpu_set_fflags(CPURISCVState *env, uint8_t hard)
     soft |= (hard & FPEXC_NV) ? float_flag_invalid : 0;
 
     set_float_exception_flags(soft, &env->fp_status);
+    if (riscv_fpj_enabled()) {
+        tcg_host_fpexc_clear();
+    }
 }
 
 #ifndef CONFIG_USER_ONLY

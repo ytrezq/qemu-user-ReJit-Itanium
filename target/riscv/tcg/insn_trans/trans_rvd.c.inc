@@ -111,6 +111,10 @@ static bool trans_fmadd_d(DisasContext *ctx, arg_fmadd_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2 | a->rs3);
 
+    if (fpj_fma(ctx, MO_64, 0, a->rd, a->rs1, a->rs2, a->rs3, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
@@ -128,6 +132,11 @@ static bool trans_fmsub_d(DisasContext *ctx, arg_fmsub_d *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2 | a->rs3);
+
+    if (fpj_fma(ctx, MO_64, TCG_FPOP_F_NEG_ADD, a->rd, a->rs1, a->rs2, a->rs3,
+            a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
@@ -147,6 +156,11 @@ static bool trans_fnmsub_d(DisasContext *ctx, arg_fnmsub_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2 | a->rs3);
 
+    if (fpj_fma(ctx, MO_64, TCG_FPOP_F_NEG_PROD, a->rd, a->rs1, a->rs2,
+            a->rs3, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
@@ -164,6 +178,11 @@ static bool trans_fnmadd_d(DisasContext *ctx, arg_fnmadd_d *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2 | a->rs3);
+
+    if (fpj_fma(ctx, MO_64, TCG_FPOP_F_NEG_PROD | TCG_FPOP_F_NEG_ADD, a->rd,
+            a->rs1, a->rs2, a->rs3, a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
@@ -183,6 +202,10 @@ static bool trans_fadd_d(DisasContext *ctx, arg_fadd_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2);
 
+    if (fpj_op2(ctx, MO_64, TCG_FPOP_ADD, a->rd, a->rs1, a->rs2, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
@@ -199,6 +222,10 @@ static bool trans_fsub_d(DisasContext *ctx, arg_fsub_d *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2);
+
+    if (fpj_op2(ctx, MO_64, TCG_FPOP_SUB, a->rd, a->rs1, a->rs2, a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
@@ -217,6 +244,10 @@ static bool trans_fmul_d(DisasContext *ctx, arg_fmul_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2);
 
+    if (fpj_op2(ctx, MO_64, TCG_FPOP_MUL, a->rd, a->rs1, a->rs2, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
@@ -234,6 +265,10 @@ static bool trans_fdiv_d(DisasContext *ctx, arg_fdiv_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2);
 
+    if (fpj_op2(ctx, MO_64, TCG_FPOP_DIV, a->rd, a->rs1, a->rs2, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
@@ -250,6 +285,10 @@ static bool trans_fsqrt_d(DisasContext *ctx, arg_fsqrt_d *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1);
+
+    if (fpj_sqrt(ctx, MO_64, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
@@ -330,6 +369,11 @@ static bool trans_fmin_d(DisasContext *ctx, arg_fmin_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2);
 
+    if (ctx->priv_ver >= PRIV_VERSION_1_11_0 && fpj_op2(ctx, MO_64,
+            TCG_FPOP_MINNUM, a->rd, a->rs1, a->rs2, -1)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
@@ -345,6 +389,11 @@ static bool trans_fmax_d(DisasContext *ctx, arg_fmax_d *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd | a->rs1 | a->rs2);
+
+    if (ctx->priv_ver >= PRIV_VERSION_1_11_0 && fpj_op2(ctx, MO_64,
+            TCG_FPOP_MAXNUM, a->rd, a->rs1, a->rs2, -1)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
@@ -362,6 +411,10 @@ static bool trans_fcvt_s_d(DisasContext *ctx, arg_fcvt_s_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rs1);
 
+    if (fpj_cvt_fmt(ctx, MO_32, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
 
@@ -377,6 +430,10 @@ static bool trans_fcvt_d_s(DisasContext *ctx, arg_fcvt_d_s *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd);
+
+    if (fpj_cvt_fmt(ctx, MO_64, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -394,6 +451,10 @@ static bool trans_feq_d(DisasContext *ctx, arg_feq_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rs1 | a->rs2);
 
+    if (fpj_cmp(ctx, MO_64, TCG_FPPRED_EQ, a->rd, a->rs1, a->rs2)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
@@ -409,6 +470,10 @@ static bool trans_flt_d(DisasContext *ctx, arg_flt_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rs1 | a->rs2);
 
+    if (fpj_cmp(ctx, MO_64, TCG_FPPRED_LT, a->rd, a->rs1, a->rs2)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_d(ctx, a->rs2);
@@ -423,6 +488,10 @@ static bool trans_fle_d(DisasContext *ctx, arg_fle_d *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rs1 | a->rs2);
+
+    if (fpj_cmp(ctx, MO_64, TCG_FPPRED_LE, a->rd, a->rs1, a->rs2)) {
+        return true;
+    }
 
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
@@ -453,6 +522,10 @@ static bool trans_fcvt_w_d(DisasContext *ctx, arg_fcvt_w_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rs1);
 
+    if (fpj_cvti(ctx, MO_64, TCG_FPOP_CVTI_S32, false, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
 
@@ -468,6 +541,10 @@ static bool trans_fcvt_wu_d(DisasContext *ctx, arg_fcvt_wu_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rs1);
 
+    if (fpj_cvti(ctx, MO_64, TCG_FPOP_CVTI_U32, true, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
 
@@ -482,6 +559,11 @@ static bool trans_fcvt_d_w(DisasContext *ctx, arg_fcvt_d_w *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd);
+
+    if (fpj_cvtf(ctx, MO_64, MO_64, TCG_FPOP_CVT_S, EXT_SIGN, a->rd, a->rs1,
+            a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv src = get_gpr(ctx, a->rs1, EXT_SIGN);
@@ -499,6 +581,11 @@ static bool trans_fcvt_d_wu(DisasContext *ctx, arg_fcvt_d_wu *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd);
+
+    if (fpj_cvtf(ctx, MO_64, MO_64, TCG_FPOP_CVT_S, EXT_ZERO, a->rd, a->rs1,
+            a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv src = get_gpr(ctx, a->rs1, EXT_ZERO);
@@ -518,6 +605,10 @@ static bool trans_fcvt_l_d(DisasContext *ctx, arg_fcvt_l_d *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rs1);
 
+    if (fpj_cvti(ctx, MO_64, TCG_FPOP_CVTI_S, false, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
 
@@ -533,6 +624,10 @@ static bool trans_fcvt_lu_d(DisasContext *ctx, arg_fcvt_lu_d *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rs1);
+
+    if (fpj_cvti(ctx, MO_64, TCG_FPOP_CVTI_U, false, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
 
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_d(ctx, a->rs1);
@@ -564,6 +659,11 @@ static bool trans_fcvt_d_l(DisasContext *ctx, arg_fcvt_d_l *a)
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd);
 
+    if (fpj_cvtf(ctx, MO_64, MO_64, TCG_FPOP_CVT_S, EXT_NONE, a->rd, a->rs1,
+            a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv src = get_gpr(ctx, a->rs1, EXT_SIGN);
 
@@ -581,6 +681,11 @@ static bool trans_fcvt_d_lu(DisasContext *ctx, arg_fcvt_d_lu *a)
     REQUIRE_FPU;
     REQUIRE_ZDINX_OR_D(ctx);
     REQUIRE_EVEN(ctx, a->rd);
+
+    if (fpj_cvtf(ctx, MO_64, MO_64, TCG_FPOP_CVT_U, EXT_NONE, a->rd, a->rs1,
+            a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv src = get_gpr(ctx, a->rs1, EXT_ZERO);

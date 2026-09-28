@@ -29,6 +29,14 @@
 #ifndef TCG_FPOP_H
 #define TCG_FPOP_H
 
+/*
+ * fpop1_i64, fpop2_i64, fpop3_i64 are the scalar ops of TCG_TYPE_V64 on
+ * i64 temps instead of vectors, for front ends that keep FP registers in
+ * i64 globals: a MO_32 element is the low half of the i64 (the high half
+ * is ignored), and a binary32 or int32 result is zero-extended.  With
+ * fpop2_i64, TCG_FPOP_CMP gives 0 or 1.
+ */
+
 typedef enum TCGFPOp {
     /* fpop2_vec d, a, b */
     TCG_FPOP_ADD,
@@ -111,6 +119,19 @@ typedef enum TCGFPOp {
 #define TCG_FPOP_F_NAN_ZERO     (1u << 27)
 /* fpcmpcc_vec: Arm NZCV in bits 31..28 instead of TCG_FPCC_* */
 #define TCG_FPOP_F_CC_NZCV      (1u << 28)
+/*
+ * RISC-V rules, scalar (TCG_TYPE_V64) only:
+ *  - every NaN result is the default NaN (0x7ff8000000000000 /
+ *    0x7fc00000), and 0 * inf + a quiet NaN signals invalid (FMA);
+ *  - tininess is detected after rounding, as on x86;
+ *  - MAXNUM, MINNUM are IEEE 754-2019 maximumNumber, minimumNumber: any
+ *    NaN, signalling (which signals invalid) or not, loses against a
+ *    number, and two NaNs give the default NaN;
+ *  - CVTI_*: out-of-range values saturate, and a NaN converts to the
+ *    maximum integer.
+ * Not with the other NaN, rounding or saturation flags.
+ */
+#define TCG_FPOP_F_RISCV        (1u << 29)
 
 /* CMP predicates */
 typedef enum TCGFPPred {

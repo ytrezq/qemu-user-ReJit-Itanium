@@ -20,6 +20,7 @@
 #include "qemu/log.h"
 #include "cpu.h"
 #include "tcg/tcg-op.h"
+#include "tcg/tcg-fpop.h"
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
 #include "exec/target_page.h"
@@ -28,6 +29,9 @@
 #include "exec/translation-block.h"
 #include "exec/log.h"
 #include "semihosting/semihost.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/guest-base.h"
+#endif
 
 #include "internals.h"
 
@@ -114,6 +118,9 @@ typedef struct DisasContext {
     bool itrigger;
     /* FRM is known to contain a valid value. */
     bool frm_valid;
+    /* F and D instructions in host FP code, frm of the TB flags */
+    bool fpj;
+    uint8_t fpj_frm;
     bool insn_start_updated;
     const GPtrArray *decoders;
     /* a vector instruction (not vsetvl*) reads the vector TB flags */
@@ -1399,6 +1406,8 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->virt_enabled = FIELD_EX32(tb_flags, TB_FLAGS, VIRT_ENABLED);
     ctx->misa_ext = env->misa_ext;
     ctx->frm = -1;  /* unknown rounding mode */
+    ctx->fpj = riscv_fpj_enabled() && !cpu->cfg.ext_zfinx;
+    ctx->fpj_frm = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, FRM);
     ctx->cfg_ptr = &(cpu->cfg);
     ctx->vill = FIELD_EX32(tb_flags, TB_FLAGS, VILL);
     ctx->sew = FIELD_EX32(tb_flags, TB_FLAGS, SEW);

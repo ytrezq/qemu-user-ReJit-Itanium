@@ -39,6 +39,195 @@
     }                                                   \
 } while (0)
 
+/*
+ * F and D instructions in host FP code (user mode, riscv64), see
+ * TCG_FPOP_F_RISCV in tcg/tcg-fpop.h, when they round to nearest even:
+ * rm RNE, or DYN with frm RNE, which is in the TB flags (writing frm ends
+ * the TB).  Their exception flags accumulate in the host FP status
+ * register, see riscv_cpu_get_fflags().  The registers stay in their i64
+ * globals, binary32 values NaN-boxed: the fpop*_i64 ops take them there.
+ * Each fpj_* returns false to fall back to the helper.
+ */
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
+/* rm < 0: no rounding, or rounding toward zero done by the op itself */
+static bool fpj_ok(DisasContext *ctx, MemOp esz, unsigned fpop, int rm)
+{
+    if (!ctx->fpj || get_xl(ctx) != MXL_RV64) {
+        return false;
+    }
+    if (rm >= 0 && rm != RISCV_FRM_RNE
+        && !(rm == RISCV_FRM_DYN && ctx->fpj_frm == RISCV_FRM_RNE)) {
+        return false;
+    }
+    return tcg_can_emit_fpop(fpop | TCG_FPOP_F_RISCV, TCG_TYPE_V64, esz);
+}
+
+/* a source register: a binary32 that is not NaN-boxed is the default NaN */
+static TCGv_i64 fpj_src(MemOp esz, int rs)
+{
+    TCGv_i64 t;
+
+    if (esz == MO_64) {
+        return cpu_fpr[rs];
+    }
+    t = tcg_temp_new_i64();
+    gen_check_nanbox_s(t, cpu_fpr[rs]);
+    return t;
+}
+
+static void fpj_set(DisasContext *ctx, MemOp esz, int rd, TCGv_i64 t)
+{
+    if (esz == MO_64) {
+        tcg_gen_mov_i64(cpu_fpr[rd], t);
+    } else {
+        gen_nanbox_s(cpu_fpr[rd], t);
+    }
+    mark_fs_dirty(ctx);
+}
+
+/* fadd, fsub, fmul, fdiv; fmin, fmax (MINNUM, MAXNUM) with rm = -1 */
+static bool fpj_op2(DisasContext *ctx, MemOp esz, TCGFPOp op, int rd,
+                    int rs1, int rs2, int rm)
+{
+    TCGv_i64 t;
+
+    if (!fpj_ok(ctx, esz, op, rm)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_fpop2_i64(esz, t, fpj_src(esz, rs1), fpj_src(esz, rs2),
+                      op | TCG_FPOP_F_RISCV);
+    fpj_set(ctx, esz, rd, t);
+    return true;
+}
+
+static bool fpj_sqrt(DisasContext *ctx, MemOp esz, int rd, int rs1, int rm)
+{
+    TCGv_i64 t;
+
+    if (!fpj_ok(ctx, esz, TCG_FPOP_SQRT, rm)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_fpop1_i64(esz, t, fpj_src(esz, rs1),
+                      TCG_FPOP_SQRT | TCG_FPOP_F_RISCV);
+    fpj_set(ctx, esz, rd, t);
+    return true;
+}
+
+/*
+ * fmadd: neg 0; fmsub: TCG_FPOP_F_NEG_ADD; fnmsub: TCG_FPOP_F_NEG_PROD;
+ * fnmadd: both
+ */
+static bool fpj_fma(DisasContext *ctx, MemOp esz, unsigned neg, int rd,
+                    int rs1, int rs2, int rs3, int rm)
+{
+    unsigned fpop = TCG_FPOP_FMA | neg;
+    TCGv_i64 t;
+
+    if (!fpj_ok(ctx, esz, fpop, rm)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_fpop3_i64(esz, t, fpj_src(esz, rs1), fpj_src(esz, rs2),
+                      fpj_src(esz, rs3), fpop | TCG_FPOP_F_RISCV);
+    fpj_set(ctx, esz, rd, t);
+    return true;
+}
+
+/* feq (quiet), flt, fle (signalling): 0 or 1 in rd */
+static bool fpj_cmp(DisasContext *ctx, MemOp esz, TCGFPPred pred, int rd,
+                    int rs1, int rs2)
+{
+    unsigned fpop = TCG_FPOP_CMP | TCG_FPOP_PRED(pred)
+                    | (pred != TCG_FPPRED_EQ ? TCG_FPOP_F_SIGNAL : 0);
+    TCGv dest;
+
+    if (!fpj_ok(ctx, esz, fpop, -1)) {
+        return false;
+    }
+    dest = dest_gpr(ctx, rd);
+    tcg_gen_fpop2_i64(esz, dest, fpj_src(esz, rs1), fpj_src(esz, rs2),
+                      fpop | TCG_FPOP_F_RISCV);
+    gen_set_gpr(ctx, rd, dest);
+    return true;
+}
+
+/*
+ * fcvt.{w,wu,l,lu}.{s,d}: @op the TCG_FPOP_CVTI_* of the formats, the
+ * 32-bit results sign-extended (@sext32), even unsigned ones.
+ */
+static bool fpj_cvti(DisasContext *ctx, MemOp esz, TCGFPOp op, bool sext32,
+                     int rd, int rs1, int rm)
+{
+    bool rtz = rm == RISCV_FRM_RTZ;
+    unsigned fpop = op | (rtz ? TCG_FPOP_F_TRUNC : 0);
+    TCGv dest;
+
+    if (!fpj_ok(ctx, esz, fpop, rtz ? -1 : rm)) {
+        return false;
+    }
+    dest = dest_gpr(ctx, rd);
+    tcg_gen_fpop1_i64(esz, dest, fpj_src(esz, rs1), fpop | TCG_FPOP_F_RISCV);
+    if (sext32) {
+        tcg_gen_ext32s_i64(dest, dest);
+    }
+    gen_set_gpr(ctx, rd, dest);
+    return true;
+}
+
+/*
+ * fcvt.{s,d}.{w,wu,l,lu}: TCG_FPOP_CVT_S or CVT_U (@fpop, maybe with
+ * F_RES32) of the integer of size @isz in rs1, its low 32 bits first
+ * extended per @ext (EXT_SIGN, EXT_ZERO, or EXT_NONE), to the format @fsz.
+ */
+static bool fpj_cvtf(DisasContext *ctx, MemOp fsz, MemOp isz,
+                     unsigned fpop, DisasExtend ext, int rd, int rs1, int rm)
+{
+    TCGv_i64 src = get_gpr(ctx, rs1, EXT_NONE);
+    TCGv_i64 t;
+
+    if (!fpj_ok(ctx, isz, fpop, rm)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    if (ext == EXT_SIGN) {
+        tcg_gen_ext32s_i64(t, src);
+        src = t;
+    } else if (ext == EXT_ZERO) {
+        tcg_gen_ext32u_i64(t, src);
+        src = t;
+    }
+    tcg_gen_fpop1_i64(isz, t, src, fpop | TCG_FPOP_F_RISCV);
+    fpj_set(ctx, fsz, rd, t);
+    return true;
+}
+
+/* fcvt.s.d (to MO_32), fcvt.d.s (to MO_64) */
+static bool fpj_cvt_fmt(DisasContext *ctx, MemOp to, int rd, int rs1, int rm)
+{
+    MemOp from = to == MO_32 ? MO_64 : MO_32;
+    unsigned fpop = to == MO_32 ? TCG_FPOP_CVT_F32 : TCG_FPOP_CVT_F64;
+    TCGv_i64 t;
+
+    if (!fpj_ok(ctx, from, fpop, rm)) {
+        return false;
+    }
+    t = tcg_temp_new_i64();
+    tcg_gen_fpop1_i64(from, t, fpj_src(from, rs1), fpop | TCG_FPOP_F_RISCV);
+    fpj_set(ctx, to, rd, t);
+    return true;
+}
+#else
+#define fpj_op2(ctx, esz, op, rd, rs1, rs2, rm)             false
+#define fpj_sqrt(ctx, esz, rd, rs1, rm)                     false
+#define fpj_fma(ctx, esz, neg, rd, rs1, rs2, rs3, rm)       false
+#define fpj_cmp(ctx, esz, pred, rd, rs1, rs2)               false
+#define fpj_cvti(ctx, esz, op, sext32, rd, rs1, rm)         false
+#define fpj_cvtf(ctx, fsz, isz, fpop, ext, rd, rs1, rm)     false
+#define fpj_cvt_fmt(ctx, to, rd, rs1, rm)                   false
+#endif
+
 static bool trans_flw(DisasContext *ctx, arg_flw *a)
 {
     TCGv_i64 dest;
@@ -99,6 +288,10 @@ static bool trans_fmadd_s(DisasContext *ctx, arg_fmadd_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_fma(ctx, MO_32, 0, a->rd, a->rs1, a->rs2, a->rs3, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
@@ -115,6 +308,11 @@ static bool trans_fmsub_s(DisasContext *ctx, arg_fmsub_s *a)
 {
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_fma(ctx, MO_32, TCG_FPOP_F_NEG_ADD, a->rd, a->rs1, a->rs2, a->rs3,
+            a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -133,6 +331,11 @@ static bool trans_fnmsub_s(DisasContext *ctx, arg_fnmsub_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_fma(ctx, MO_32, TCG_FPOP_F_NEG_PROD, a->rd, a->rs1, a->rs2,
+            a->rs3, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
@@ -149,6 +352,11 @@ static bool trans_fnmadd_s(DisasContext *ctx, arg_fnmadd_s *a)
 {
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_fma(ctx, MO_32, TCG_FPOP_F_NEG_PROD | TCG_FPOP_F_NEG_ADD, a->rd,
+            a->rs1, a->rs2, a->rs3, a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -167,6 +375,10 @@ static bool trans_fadd_s(DisasContext *ctx, arg_fadd_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_op2(ctx, MO_32, TCG_FPOP_ADD, a->rd, a->rs1, a->rs2, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
@@ -182,6 +394,10 @@ static bool trans_fsub_s(DisasContext *ctx, arg_fsub_s *a)
 {
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_op2(ctx, MO_32, TCG_FPOP_SUB, a->rd, a->rs1, a->rs2, a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -199,6 +415,10 @@ static bool trans_fmul_s(DisasContext *ctx, arg_fmul_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_op2(ctx, MO_32, TCG_FPOP_MUL, a->rd, a->rs1, a->rs2, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
@@ -215,6 +435,10 @@ static bool trans_fdiv_s(DisasContext *ctx, arg_fdiv_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_op2(ctx, MO_32, TCG_FPOP_DIV, a->rd, a->rs1, a->rs2, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
@@ -230,6 +454,10 @@ static bool trans_fsqrt_s(DisasContext *ctx, arg_fsqrt_s *a)
 {
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_sqrt(ctx, MO_32, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -371,6 +599,11 @@ static bool trans_fmin_s(DisasContext *ctx, arg_fmin_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (ctx->priv_ver >= PRIV_VERSION_1_11_0 && fpj_op2(ctx, MO_32,
+            TCG_FPOP_MINNUM, a->rd, a->rs1, a->rs2, -1)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
@@ -385,6 +618,11 @@ static bool trans_fmax_s(DisasContext *ctx, arg_fmax_s *a)
 {
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (ctx->priv_ver >= PRIV_VERSION_1_11_0 && fpj_op2(ctx, MO_32,
+            TCG_FPOP_MAXNUM, a->rd, a->rs1, a->rs2, -1)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -401,6 +639,10 @@ static bool trans_fcvt_w_s(DisasContext *ctx, arg_fcvt_w_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_cvti(ctx, MO_32, TCG_FPOP_CVTI_S, true, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
 
@@ -414,6 +656,10 @@ static bool trans_fcvt_wu_s(DisasContext *ctx, arg_fcvt_wu_s *a)
 {
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_cvti(ctx, MO_32, TCG_FPOP_CVTI_U, true, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
 
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -448,6 +694,10 @@ static bool trans_feq_s(DisasContext *ctx, arg_feq_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_cmp(ctx, MO_32, TCG_FPPRED_EQ, a->rd, a->rs1, a->rs2)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
@@ -462,6 +712,10 @@ static bool trans_flt_s(DisasContext *ctx, arg_flt_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_cmp(ctx, MO_32, TCG_FPPRED_LT, a->rd, a->rs1, a->rs2)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
     TCGv_i64 src2 = get_fpr_hs(ctx, a->rs2);
@@ -475,6 +729,10 @@ static bool trans_fle_s(DisasContext *ctx, arg_fle_s *a)
 {
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_cmp(ctx, MO_32, TCG_FPPRED_LE, a->rd, a->rs1, a->rs2)) {
+        return true;
+    }
 
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -503,6 +761,11 @@ static bool trans_fcvt_s_w(DisasContext *ctx, arg_fcvt_s_w *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_cvtf(ctx, MO_32, MO_32, TCG_FPOP_CVT_S, EXT_SIGN, a->rd, a->rs1,
+            a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv src = get_gpr(ctx, a->rs1, EXT_SIGN);
 
@@ -517,6 +780,11 @@ static bool trans_fcvt_s_wu(DisasContext *ctx, arg_fcvt_s_wu *a)
 {
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_cvtf(ctx, MO_32, MO_32, TCG_FPOP_CVT_U, EXT_ZERO, a->rd, a->rs1,
+            a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv src = get_gpr(ctx, a->rs1, EXT_ZERO);
@@ -551,6 +819,10 @@ static bool trans_fcvt_l_s(DisasContext *ctx, arg_fcvt_l_s *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_cvti(ctx, MO_32, TCG_FPOP_CVTI_S64, false, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
+
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
 
@@ -565,6 +837,10 @@ static bool trans_fcvt_lu_s(DisasContext *ctx, arg_fcvt_lu_s *a)
     REQUIRE_64BIT(ctx);
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_cvti(ctx, MO_32, TCG_FPOP_CVTI_U64, false, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
 
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv_i64 src1 = get_fpr_hs(ctx, a->rs1);
@@ -581,6 +857,11 @@ static bool trans_fcvt_s_l(DisasContext *ctx, arg_fcvt_s_l *a)
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
 
+    if (fpj_cvtf(ctx, MO_32, MO_64, TCG_FPOP_CVT_S | TCG_FPOP_F_RES32,
+            EXT_NONE, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
+
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv src = get_gpr(ctx, a->rs1, EXT_SIGN);
 
@@ -596,6 +877,11 @@ static bool trans_fcvt_s_lu(DisasContext *ctx, arg_fcvt_s_lu *a)
     REQUIRE_64BIT(ctx);
     REQUIRE_FPU;
     REQUIRE_ZFINX_OR_F(ctx);
+
+    if (fpj_cvtf(ctx, MO_32, MO_64, TCG_FPOP_CVT_U | TCG_FPOP_F_RES32,
+            EXT_NONE, a->rd, a->rs1, a->rm)) {
+        return true;
+    }
 
     TCGv_i64 dest = dest_fpr(ctx, a->rd);
     TCGv src = get_gpr(ctx, a->rs1, EXT_ZERO);

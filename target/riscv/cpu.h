@@ -702,6 +702,9 @@ G_NORETURN void riscv_raise_exception(CPURISCVState *env,
 
 uint8_t riscv_cpu_get_fflags(CPURISCVState *env);
 void riscv_cpu_set_fflags(CPURISCVState *env, uint8_t);
+/* FP instructions in host code: see trans_rvf.c.inc */
+bool riscv_fpj_enabled(void);
+void riscv_fpj_sync(CPURISCVState *env);
 void riscv_cpu_check_fflags(CPURISCVState *env, FloatExceptionFlags);
 
 #ifndef CONFIG_USER_ONLY
@@ -742,6 +745,8 @@ FIELD(TB_FLAGS, PM_SIGNEXTEND, 31, 1)
 FIELD(EXT_TB_FLAGS, MISA_EXT, 0, 32)
 FIELD(EXT_TB_FLAGS, ALTFMT, 32, 1)
 FIELD(EXT_TB_FLAGS, BIG_ENDIAN, 33, 1)
+/* user mode: frm, for the FP instructions in host code (dynamic rounding) */
+FIELD(EXT_TB_FLAGS, FRM, 34, 3)
 
 #ifdef TARGET_RISCV32
 #define riscv_cpu_mxl(env)  ((void)(env), MXL_RV32)

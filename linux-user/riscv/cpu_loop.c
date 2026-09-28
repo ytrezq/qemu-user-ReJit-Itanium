@@ -25,6 +25,7 @@
 #include "signal-common.h"
 #include "elf.h"
 #include "semihosting/common-semi.h"
+#include "tcg/tcg-fpop.h"
 
 void cpu_loop(CPURISCVState *env)
 {
@@ -52,6 +53,15 @@ void cpu_loop(CPURISCVState *env)
                    self-modifying code is automatically detected */
                 ret = 0;
             } else {
+                /*
+                 * Make fflags exact before e.g. clone() copies them or
+                 * sigreturn replaces them, and do not let host code in
+                 * the syscall leave host FP flags behind.
+                 */
+                uint32_t fpenv;
+
+                riscv_fpj_sync(env);
+                fpenv = tcg_host_fpenv_save();
                 ret = do_syscall(env,
                                  env->gpr[(env->elf_flags & EF_RISCV_RVE)
                                     ? xT0 : xA7],
@@ -62,6 +72,7 @@ void cpu_loop(CPURISCVState *env)
                                  env->gpr[xA4],
                                  env->gpr[xA5],
                                  0, 0);
+                tcg_host_fpenv_restore(fpenv);
             }
             if (ret == -QEMU_ERESTARTSYS) {
                 env->pc -= 4;
