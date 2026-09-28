@@ -851,6 +851,14 @@ void HELPER(arm_unaligned_access)(CPUARMState *env, uint64_t addr,
  */
 static bool mops_enabled(CPUARMState *env)
 {
+#ifdef CONFIG_USER_ONLY
+    /*
+     * EL0 without EL2: HCRX_EL2.MSCEn behaves as 1 and HCR_EL2 as 0, so
+     * this is SCTLR_EL1.MSCEn, without the cost of arm_hcrx_el2_eff() and
+     * arm_hcr_el2_eff() at every memcpy and memset of the guest libc.
+     */
+    return env->cp15.sctlr_el[1] & SCTLR_MSCEN;
+#else
     int el = arm_current_el(env);
 
     if (el < 2 &&
@@ -867,6 +875,7 @@ static bool mops_enabled(CPUARMState *env)
         }
     }
     return true;
+#endif
 }
 
 static void check_mops_enabled(CPUARMState *env, uintptr_t ra)
