@@ -962,6 +962,15 @@ static void ldst_us_prefix(DisasContext *s, int rs1, uint32_t gofs,
  * the faulting one (or the pieces before, see ldst_us_prefix) possibly
  * written.
  */
+static bool ldst_us_inline_ok(DisasContext *s, arg_r2nfvm *a, bool is_store)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+
+    return (vlenb == 16 || vlenb == 32) && a->nf == 1 && s->vstart_eq_zero
+           && tcg_can_emit_ldstm(vlenb == 32 ? TCG_TYPE_V256 : TCG_TYPE_V128)
+           && (is_store || !(s->vta || (!a->vm && s->vma)));
+}
+
 static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
                            bool is_store)
 {
@@ -974,9 +983,7 @@ static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
     TCGv_i32 lo = NULL;
     int r;
 
-    if ((vlenb != 16 && vlenb != 32) || a->nf != 1 || !s->vstart_eq_zero
-        || !tcg_can_emit_ldstm(type)
-        || (!is_store && (s->vta || (!a->vm && s->vma)))) {
+    if (!ldst_us_inline_ok(s, a, is_store)) {
         return false;
     }
 
@@ -1078,6 +1085,11 @@ static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
     return true;
 }
 #else
+static bool ldst_us_inline_ok(DisasContext *s, arg_r2nfvm *a, bool is_store)
+{
+    return false;
+}
+
 static bool ldst_us_inline(DisasContext *s, arg_r2nfvm *a, uint8_t eew,
                            bool is_store)
 {
@@ -1498,10 +1510,47 @@ static bool ldff_op(DisasContext *s, arg_r2nfvm *a, uint8_t eew)
         gen_helper_vle8ff_v, gen_helper_vle16ff_v,
         gen_helper_vle32ff_v, gen_helper_vle64ff_v
     };
+    TCGLabel *done = NULL;
+    target_ulong pc_save = s->pc_save;
 
     fn = fns[eew];
     if (fn == NULL) {
         return false;
+    }
+
+    /*
+     * Unmasked, with all the elements below vl in the page of the first
+     * one (strlen, strchr... of glibc, as long as they do not reach the
+     * end of a page): either that page can be read, or the first element
+     * faults; vl does not change.  Then the load of vle<eew>.v, and the
+     * TB goes on; otherwise the helper, which may reduce vl, and the TB
+     * ends (the code after the label only follows the inline load: the pc
+     * was not updated there).
+     */
+    if (a->vm && ldst_us_inline_ok(s, a, false) && s->vl_const == 0) {
+        /* no element: neither a fault nor a change of vl */
+        return ldst_us_inline(s, a, eew, false);
+    }
+    if (a->vm && ldst_us_inline_ok(s, a, false)) {
+        TCGLabel *slow = gen_new_label();
+        TCGv addr = get_address(s, a->rs1, 0);
+        TCGv last = tcg_temp_new();
+
+        done = gen_new_label();
+        if (s->vl_const > 0) {
+            tcg_gen_addi_tl(last, addr,
+                            ((target_ulong)s->vl_const << eew) - 1);
+        } else {
+            tcg_gen_extu_i32_tl(last, cpu_vl);
+            tcg_gen_shli_tl(last, last, eew);
+            tcg_gen_add_tl(last, last, addr);
+            tcg_gen_subi_tl(last, last, 1);
+        }
+        tcg_gen_xor_tl(last, last, addr);
+        tcg_gen_brcondi_tl(TCG_COND_GEU, last, TARGET_PAGE_SIZE, slow);
+        ldst_us_inline(s, a, eew, false);
+        tcg_gen_br(done);
+        gen_set_label(slow);
     }
 
     uint8_t emul = vext_get_emul(s, eew);
@@ -1510,7 +1559,13 @@ static bool ldff_op(DisasContext *s, arg_r2nfvm *a, uint8_t eew)
     data = FIELD_DP32(data, VDATA, NF, a->nf);
     data = FIELD_DP32(data, VDATA, VTA, s->vta);
     data = FIELD_DP32(data, VDATA, VMA, s->vma);
-    return ldff_trans(a->rd, a->rs1, data, fn, s);
+    ldff_trans(a->rd, a->rs1, data, fn, s);
+    if (done) {
+        gen_set_label(done);
+        s->base.is_jmp = DISAS_NEXT;
+        s->pc_save = pc_save;
+    }
+    return true;
 }
 
 GEN_VEXT_TRANS(vle8ff_v,  MO_8,  r2nfvm, ldff_op, ld_us_check)
