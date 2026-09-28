@@ -36,6 +36,8 @@ typedef enum TCGFPOp {
     TCG_FPOP_MAXC,      /* a > b ? a : b  (b if unordered or equal) */
     TCG_FPOP_MINC,      /* a < b ? a : b  (b if unordered or equal) */
     TCG_FPOP_CMP,       /* all-ones element mask if TCG_FPOP_PRED holds */
+    TCG_FPOP_MAXNUM,    /* IEEE 754-2008 maxNum: -0 < +0, a quiet NaN loses */
+    TCG_FPOP_MINNUM,    /* IEEE 754-2008 minNum */
 
     /* fpop1_vec d, a */
     TCG_FPOP_SQRT,

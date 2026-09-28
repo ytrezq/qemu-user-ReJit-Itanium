@@ -3068,12 +3068,19 @@ TRANS_FLAGS2(VSX, XVSUBDP, do_vsj_XX3, gen_helper_XVSUBDP, VSJ_VD(DEFNAN_(SUB)))
 TRANS_FLAGS2(VSX, XVMULDP, do_vsj_XX3, gen_helper_XVMULDP, VSJ_VD(DEFNAN_(MUL)))
 TRANS_FLAGS2(VSX, XVDIVDP, do_vsj_XX3, gen_helper_XVDIVDP, VSJ_VD(DEFNAN_(DIV)))
 
-TRANS_FLAGS2(VSX, XSMAXDP, do_helper_XX3, gen_helper_XSMAXDP)
-TRANS_FLAGS2(VSX, XSMINDP, do_helper_XX3, gen_helper_XSMINDP)
-TRANS_FLAGS2(VSX, XVMAXSP, do_helper_XX3, gen_helper_XVMAXSP)
-TRANS_FLAGS2(VSX, XVMINSP, do_helper_XX3, gen_helper_XVMINSP)
-TRANS_FLAGS2(VSX, XVMAXDP, do_helper_XX3, gen_helper_XVMAXDP)
-TRANS_FLAGS2(VSX, XVMINDP, do_helper_XX3, gen_helper_XVMINDP)
+/* maxNum/minNum; like the helpers, neither FI nor FPRF */
+TRANS_FLAGS2(VSX, XSMAXDP, do_vsj_XX3, gen_helper_XSMAXDP,
+             VSJ_SF(TCG_FPOP_MAXNUM))
+TRANS_FLAGS2(VSX, XSMINDP, do_vsj_XX3, gen_helper_XSMINDP,
+             VSJ_SF(TCG_FPOP_MINNUM))
+TRANS_FLAGS2(VSX, XVMAXSP, do_vsj_XX3, gen_helper_XVMAXSP,
+             VSJ_VW(TCG_FPOP_MAXNUM))
+TRANS_FLAGS2(VSX, XVMINSP, do_vsj_XX3, gen_helper_XVMINSP,
+             VSJ_VW(TCG_FPOP_MINNUM))
+TRANS_FLAGS2(VSX, XVMAXDP, do_vsj_XX3, gen_helper_XVMAXDP,
+             VSJ_VD(TCG_FPOP_MAXNUM))
+TRANS_FLAGS2(VSX, XVMINDP, do_vsj_XX3, gen_helper_XVMINDP,
+             VSJ_VD(TCG_FPOP_MINNUM))
 
 static bool do_helper_X(arg_X *a,
     void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))

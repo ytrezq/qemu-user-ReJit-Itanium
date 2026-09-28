@@ -85,6 +85,8 @@
 #define FPO_PBLENDMD    (0x64 | P_EXT38 | P_DATA16)
 #define FPO_FPCLASSSD   (0x67 | P_EXT3A | P_DATA16 | P_VEXW)
 #define FPO_PERMI2B     (0x75 | P_EXT38 | P_DATA16)
+#define FPO_RANGEP      (0x50 | P_EXT3A | P_DATA16)     /* +1 scalar, W1 double */
+#define FPO_FPCLASSP    (0x66 | P_EXT3A | P_DATA16)     /* +1 scalar, W1 double */
 #define FPO_PCMPQ       (0x1f | P_EXT3A | P_DATA16 | P_VEXW)
 #define FPO_PCMPD       (0x1f | P_EXT3A | P_DATA16)
 #define FPO_PMOVQ2M     (0x39 | P_EXT38 | P_SIMDF3 | P_VEXW)
@@ -543,6 +545,39 @@ static void tcg_out_fpop2(TCGContext *s, TCGType type, unsigned vece,
     case TCG_FPOP_MAXC:
         fpo_rrr(s, FPO_MAX | pfx, d, a, b, 0, false);
         return;
+    case TCG_FPOP_MAXNUM:
+    case TCG_FPOP_MINNUM:
+        {
+            /*
+             * vrange orders -0 < +0 (sign from the selected operand); NaNs
+             * are fixed up afterwards: a quiet NaN loses against a number,
+             * otherwise the result is the first NaN operand, quieted.
+             */
+            int range = (FPO_RANGEP + (scalar ? 1 : 0)) | (dbl ? P_VEXW : 0);
+            int cls = (FPO_FPCLASSP + (scalar ? 1 : 0)) | (dbl ? P_VEXW : 0);
+            int blend = dbl ? FPO_PBLENDMQ : FPO_PBLENDMD;
+            int por = dbl ? FPO_PORQ : FPO_PORD;
+            bool max = TCG_FPOP_OP(fpop) == TCG_FPOP_MAXNUM;
+            uint8_t *done;
+
+            fpo_rrri(s, range, d, a, b, 0, false, max ? 0x05 : 0x04);
+            fpo_rrri(s, cls, FPK1, 0, a, 0, false, 0x81);          /* a NaN */
+            fpo_rrri(s, cls, FPK2, 0, b, 0, false, 0x81);          /* b NaN */
+            tcg_out_vex_modrm(s, FPO_KORTESTB, FPK1, 0, FPK2);
+            done = fpo_jcc8(s, JCC_JE);
+            /* NaN lanes: quiet(a) if a is a NaN, else quiet(b) */
+            fpo_rrc(s, por, d, b, FPK2, false, fpo_quiet_bit(dbl));
+            fpo_rrc(s, por, d, a, FPK1, false, fpo_quiet_bit(dbl));
+            /* a quiet NaN against a number: the number */
+            fpo_rrri(s, cls, FPK3, 0, a, 0, false, 0x01);          /* a qNaN */
+            fpo_kop(s, FPO_KANDNB, FPK3, FPK2, FPK3);              /* & !b NaN */
+            fpo_rrr(s, blend, d, d, b, FPK3, false);
+            fpo_rrri(s, cls, FPK3, 0, b, 0, false, 0x01);          /* b qNaN */
+            fpo_kop(s, FPO_KANDNB, FPK3, FPK1, FPK3);              /* & !a NaN */
+            fpo_rrr(s, blend, d, d, a, FPK3, false);
+            fpo_patch8(s, done);
+        }
+        return;
     case TCG_FPOP_MINC:
         fpo_rrr(s, FPO_MIN | pfx, d, a, b, 0, false);
         return;
@@ -870,6 +905,8 @@ static bool tcg_target_can_emit_fpop(unsigned fpop, TCGType type,
     case TCG_FPOP_DIV:
     case TCG_FPOP_MAXC:
     case TCG_FPOP_MINC:
+    case TCG_FPOP_MAXNUM:
+    case TCG_FPOP_MINNUM:
     case TCG_FPOP_CMP:
     case TCG_FPOP_SQRT:
     case TCG_FPOP_RINT:
