@@ -221,13 +221,14 @@ static void ppc_fpscr_fold(CPUPPCState *env)
             fpscr = deposit64(fpscr, FPSCR_FPRF, 5, fprf);
         }
     }
-    if ((env->fprf_lazy & PPC_FPRF_LAZY_RESULT) || env->fp_host_used) {
-        /* arithmetic and conversions: FI approximated, see above */
+    if ((env->fprf_lazy & PPC_FPRF_LAZY_RESULT) || env->fp_host_fi) {
+        /* scalar arithmetic and conversions: FI approximated, see above */
         fpscr &= ~FP_FR;
         fpscr = FIELD_DP64(fpscr, FPSCR, FI, inexact);
     }
     env->fprf_lazy = 0;
     env->fp_host_used = 0;
+    env->fp_host_fi = 0;
     env->fpscr = fpscr;
 }
 
@@ -241,7 +242,7 @@ static void ppc_fpscr_fold(CPUPPCState *env)
  */
 void ppc_fpscr_sync(CPUPPCState *env)
 {
-    if (unlikely(env->fprf_lazy | env->fp_host_used)) {
+    if (unlikely(env->fprf_lazy | env->fp_host_used | env->fp_host_fi)) {
         ppc_fpscr_fold(env);
     }
 }
@@ -2291,6 +2292,8 @@ void helper_xscmpexpdp(CPUPPCState *env, uint32_t opcode,
     int64_t exp_a, exp_b;
     uint32_t cc;
 
+    ppc_fpscr_sync(env);
+
     exp_a = extract64(xa->VsrD(0), 52, 11);
     exp_b = extract64(xb->VsrD(0), 52, 11);
 
@@ -2319,6 +2322,8 @@ void helper_xscmpexpqp(CPUPPCState *env, uint32_t opcode,
 {
     int64_t exp_a, exp_b;
     uint32_t cc;
+
+    ppc_fpscr_sync(env);
 
     exp_a = extract64(xa->VsrD(0), 48, 15);
     exp_b = extract64(xb->VsrD(0), 48, 15);
@@ -3285,6 +3290,7 @@ static bool not_SP_value(float64 val)
                        uint32_t dcmx, ppc_vsr_t *b)                         \
     {                                                                       \
         uint32_t cc, match, sign = TP##_is_neg(b->FLD);                     \
+        ppc_fpscr_sync(env);                                                \
         match = TP##_tstdc(b->FLD, dcmx);                                   \
         cc = sign << CRF_LT_BIT | match << CRF_EQ_BIT;                      \
         env->fpscr &= ~FP_FPCC;                                             \
@@ -3302,6 +3308,7 @@ void helper_XSTSTDCSP(CPUPPCState *env, uint32_t bf,
     uint32_t cc, match, sign = float64_is_neg(b->VsrD(0));
     uint32_t exp = (b->VsrD(0) >> 52) & 0x7FF;
     int not_sp = (int)not_SP_value(b->VsrD(0));
+    ppc_fpscr_sync(env);
     match = float64_tstdc(b->VsrD(0), dcmx) || (exp > 0 && exp < 0x381);
     cc = sign << CRF_LT_BIT | match << CRF_EQ_BIT | not_sp << CRF_SO_BIT;
     env->fpscr &= ~FP_FPCC;
@@ -3474,6 +3481,7 @@ static inline void vsxger_excp(CPUPPCState *env, uintptr_t retaddr)
      * are disabled and only at the end throw an exception
      */
     target_ulong enable;
+    ppc_fpscr_sync(env);
     enable = env->fpscr & (FP_ENABLES | FP_FI | FP_FR);
     env->fpscr &= ~(FP_ENABLES | FP_FI | FP_FR);
     int status = get_float_exception_flags(&env->fp_status);

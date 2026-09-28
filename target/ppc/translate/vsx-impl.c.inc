@@ -34,6 +34,94 @@ static inline TCGv_ptr gen_acc_ptr(int reg)
     return r;
 }
 
+/*
+ * VSX floating point as host FP code (ctx->fp_jit, see fp-impl.c.inc).
+ * Scalar instructions (TCG_TYPE_V64) work on doubleword 0 and clear
+ * doubleword 1, vector ones (TCG_TYPE_V128) on the whole register, whose
+ * element order does not matter to element-wise operations.
+ */
+#define VSJ_S(op)   (op), TCG_TYPE_V64, MO_64, FPJ_FPRF
+#define VSJ_SI(op)  (op), TCG_TYPE_V64, MO_64, FPJ_FI
+#define VSJ_SF(op)  (op), TCG_TYPE_V64, MO_64, FPJ_FLAGS
+#define VSJ_VD(op)  (op), TCG_TYPE_V128, MO_64, FPJ_FLAGS
+#define VSJ_VW(op)  (op), TCG_TYPE_V128, MO_32, FPJ_FLAGS
+#define DEFNAN_(op)     (TCG_FPOP_##op | TCG_FPOP_F_DEFNAN)
+#define SPNAN_(op)      (DEFNAN_(op) | TCG_FPOP_F_SP)
+
+static bool vsj_ok(DisasContext *ctx, unsigned fpop, TCGType type,
+                   unsigned vece)
+{
+    return ctx->fp_jit && fpop && tcg_can_emit_fpop(fpop, type, vece);
+}
+
+static TCGv_vec vsj_ld(TCGType type, int reg)
+{
+    TCGv_vec v = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(v, tcg_env, type == TCG_TYPE_V64 ? vsr64_offset(reg, true)
+                                                    : vsr_full_offset(reg));
+    return v;
+}
+
+static void vsj_st(TCGType type, int reg, TCGv_vec v, FPJRes res)
+{
+    if (type == TCG_TYPE_V64) {
+        fpj_st_res(reg, v, res);
+    } else {
+        tcg_gen_st_vec(v, tcg_env, vsr_full_offset(reg));
+        fpj_mark(v, res);
+    }
+}
+
+static bool vsj_op1(DisasContext *ctx, int xt, int xb, unsigned fpop,
+                    TCGType type, unsigned vece, FPJRes res)
+{
+    TCGv_vec vb, vt;
+
+    if (!vsj_ok(ctx, fpop, type, vece)) {
+        return false;
+    }
+    vb = vsj_ld(type, xb);
+    vt = tcg_temp_new_vec(type);
+    tcg_gen_fpop1_vec(vece, vt, vb, fpop);
+    vsj_st(type, xt, vt, res);
+    return true;
+}
+
+static bool vsj_op2(DisasContext *ctx, int xt, int xa, int xb, unsigned fpop,
+                    TCGType type, unsigned vece, FPJRes res)
+{
+    TCGv_vec va, vb, vt;
+
+    if (!vsj_ok(ctx, fpop, type, vece)) {
+        return false;
+    }
+    va = vsj_ld(type, xa);
+    vb = vsj_ld(type, xb);
+    vt = tcg_temp_new_vec(type);
+    tcg_gen_fpop2_vec(vece, vt, va, vb, fpop);
+    vsj_st(type, xt, vt, res);
+    return true;
+}
+
+/* xt = xa * xb + xc, with the PowerPC NaN priority a, c, b */
+static bool vsj_fma(DisasContext *ctx, int xt, int xa, int xb, int xc,
+                    unsigned fpop, TCGType type, unsigned vece, FPJRes res)
+{
+    TCGv_vec va, vb, vc, vt;
+
+    fpop |= TCG_FPOP_FMA | TCG_FPOP_F_DEFNAN | TCG_FPOP_F_NAN_ACB;
+    if (!vsj_ok(ctx, fpop, type, vece)) {
+        return false;
+    }
+    va = vsj_ld(type, xa);
+    vb = vsj_ld(type, xb);
+    vc = vsj_ld(type, xc);
+    vt = tcg_temp_new_vec(type);
+    tcg_gen_fpop3_vec(vece, vt, va, vb, vc, fpop);
+    vsj_st(type, xt, vt, res);
+    return true;
+}
+
 static bool do_lxs(DisasContext *ctx, arg_X *a,
                    void (*op)(DisasContext *, TCGv_i64, TCGv))
 {
@@ -797,11 +885,36 @@ TRANS(XVCPSGNSP, do_xvcpsgn, MO_32)
 TRANS(XVCPSGNDP, do_xvcpsgn, MO_64)
 
 static bool do_cmp(DisasContext *ctx, arg_XX3_rc *a,
-            void (*helper)(TCGv_i32, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))
+            void (*helper)(TCGv_i32, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr),
+            unsigned vece, unsigned fpop)
 {
     TCGv_i32 dest;
     TCGv_ptr xt, xa, xb;
     REQUIRE_VSX(ctx);
+    /* all-ones elements where xa pred xb; always false for NaNs */
+    if (vsj_op2(ctx, a->xt, a->xa, a->xb, TCG_FPOP_CMP | fpop,
+                TCG_TYPE_V128, vece, FPJ_FLAGS)) {
+        if (a->rc) {
+            TCGv_i64 lo = tcg_temp_new_i64();
+            TCGv_i64 hi = tcg_temp_new_i64();
+            TCGv_i64 t = tcg_temp_new_i64();
+            TCGv_i32 f = tcg_temp_new_i32();
+
+            /* CR6: 0b1000 if all true, 0b0010 if all false */
+            get_cpu_vsr(lo, a->xt, false);
+            get_cpu_vsr(hi, a->xt, true);
+            tcg_gen_and_i64(t, lo, hi);
+            tcg_gen_setcondi_i64(TCG_COND_EQ, t, t, -1);
+            tcg_gen_extrl_i64_i32(cpu_crf[6], t);
+            tcg_gen_shli_i32(cpu_crf[6], cpu_crf[6], 3);
+            tcg_gen_or_i64(t, lo, hi);
+            tcg_gen_setcondi_i64(TCG_COND_EQ, t, t, 0);
+            tcg_gen_extrl_i64_i32(f, t);
+            tcg_gen_shli_i32(f, f, 1);
+            tcg_gen_or_i32(cpu_crf[6], cpu_crf[6], f);
+        }
+        return true;
+    }
     xt = gen_vsr_ptr(a->xt);
     xa = gen_vsr_ptr(a->xa);
     xb = gen_vsr_ptr(a->xb);
@@ -810,14 +923,23 @@ static bool do_cmp(DisasContext *ctx, arg_XX3_rc *a,
     return true;
 }
 
-TRANS_FLAGS2(VSX, XVCMPEQSP, do_cmp, gen_helper_XVCMPEQSP);
-TRANS_FLAGS2(VSX, XVCMPGTSP, do_cmp, gen_helper_XVCMPGTSP);
-TRANS_FLAGS2(VSX, XVCMPGESP, do_cmp, gen_helper_XVCMPGESP);
-TRANS_FLAGS2(ISA300, XVCMPNESP, do_cmp, gen_helper_XVCMPNESP);
-TRANS_FLAGS2(VSX, XVCMPEQDP, do_cmp, gen_helper_XVCMPEQDP);
-TRANS_FLAGS2(VSX, XVCMPGTDP, do_cmp, gen_helper_XVCMPGTDP);
-TRANS_FLAGS2(VSX, XVCMPGEDP, do_cmp, gen_helper_XVCMPGEDP);
-TRANS_FLAGS2(ISA300, XVCMPNEDP, do_cmp, gen_helper_XVCMPNEDP);
+/* gt, ge set VXVC for quiet NaNs too: signalling compares */
+#define VSJ_CMP(p)      TCG_FPOP_PRED(TCG_FPPRED_##p)
+#define VSJ_CMPS(p)     (TCG_FPOP_PRED(TCG_FPPRED_##p) | TCG_FPOP_F_SIGNAL)
+TRANS_FLAGS2(VSX, XVCMPEQSP, do_cmp, gen_helper_XVCMPEQSP, MO_32, VSJ_CMP(EQ));
+TRANS_FLAGS2(VSX, XVCMPGTSP, do_cmp, gen_helper_XVCMPGTSP, MO_32,
+             VSJ_CMPS(GT));
+TRANS_FLAGS2(VSX, XVCMPGESP, do_cmp, gen_helper_XVCMPGESP, MO_32,
+             VSJ_CMPS(GE));
+TRANS_FLAGS2(ISA300, XVCMPNESP, do_cmp, gen_helper_XVCMPNESP, MO_32,
+             VSJ_CMP(LTGT));
+TRANS_FLAGS2(VSX, XVCMPEQDP, do_cmp, gen_helper_XVCMPEQDP, MO_64, VSJ_CMP(EQ));
+TRANS_FLAGS2(VSX, XVCMPGTDP, do_cmp, gen_helper_XVCMPGTDP, MO_64,
+             VSJ_CMPS(GT));
+TRANS_FLAGS2(VSX, XVCMPGEDP, do_cmp, gen_helper_XVCMPGEDP, MO_64,
+             VSJ_CMPS(GE));
+TRANS_FLAGS2(ISA300, XVCMPNEDP, do_cmp, gen_helper_XVCMPNEDP, MO_64,
+             VSJ_CMP(LTGT));
 
 static bool trans_XSCVQPDP(DisasContext *ctx, arg_X_tb_rc *a)
 {
@@ -872,6 +994,23 @@ static void gen_##name(DisasContext *ctx)                                     \
     TCGv_ptr xt, xb;                                                          \
     if (unlikely(!ctx->vsx_enabled)) {                                        \
         gen_exception(ctx, POWERPC_EXCP_VSXU);                                \
+        return;                                                               \
+    }                                                                         \
+    xt = gen_vsr_ptr(xT(ctx->opcode));                                        \
+    xb = gen_vsr_ptr(xB(ctx->opcode));                                        \
+    gen_helper_##name(tcg_env, xt, xb);                                       \
+}
+
+/* GEN_VSX_HELPER_X2 with a host FP version, see vsj_op1() */
+#define GEN_VSX_HELPER_X2_J(name, op1, op2, inval, type, ...)                 \
+static void gen_##name(DisasContext *ctx)                                     \
+{                                                                             \
+    TCGv_ptr xt, xb;                                                          \
+    if (unlikely(!ctx->vsx_enabled)) {                                        \
+        gen_exception(ctx, POWERPC_EXCP_VSXU);                                \
+        return;                                                               \
+    }                                                                         \
+    if (vsj_op1(ctx, xT(ctx->opcode), xB(ctx->opcode), __VA_ARGS__)) {       \
         return;                                                               \
     }                                                                         \
     xt = gen_vsr_ptr(xT(ctx->opcode));                                        \
@@ -975,14 +1114,46 @@ GEN_VSX_HELPER_R3(xsaddqp, 0x04, 0x00, 0, PPC2_ISA300)
 GEN_VSX_HELPER_R3(xsmulqp, 0x04, 0x01, 0, PPC2_ISA300)
 GEN_VSX_HELPER_R3(xsdivqp, 0x04, 0x11, 0, PPC2_ISA300)
 GEN_VSX_HELPER_X2(xsredp, 0x14, 0x05, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xssqrtdp, 0x16, 0x04, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xssqrtdp, 0x16, 0x04, 0, PPC2_VSX,
+                    VSJ_S(DEFNAN_(SQRT)))
 GEN_VSX_HELPER_X2(xsrsqrtedp, 0x14, 0x04, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2_AB(xstdivdp, 0x14, 0x07, 0, PPC2_VSX)
 GEN_VSX_HELPER_X1(xstsqrtdp, 0x14, 0x06, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2_AB(xscmpexpdp, 0x0C, 0x07, 0, PPC2_ISA300)
 GEN_VSX_HELPER_R2_AB(xscmpexpqp, 0x04, 0x05, 0, PPC2_ISA300)
-GEN_VSX_HELPER_X2_AB(xscmpodp, 0x0C, 0x05, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2_AB(xscmpudp, 0x0C, 0x04, 0, PPC2_VSX)
+/* xscmpodp, xscmpudp: like fcmpo, fcmpu */
+static void gen_xscmpo_u(DisasContext *ctx, bool ordered)
+{
+    TCGv_i32 opc;
+    TCGv_ptr xa, xb;
+    if (unlikely(!ctx->vsx_enabled)) {
+        gen_exception(ctx, POWERPC_EXCP_VSXU);
+        return;
+    }
+    if (ctx->fp_jit) {
+        gen_fpj_cmp(xA(ctx->opcode), xB(ctx->opcode), crfD(ctx->opcode),
+                    ordered);
+        return;
+    }
+    opc = tcg_constant_i32(ctx->opcode);
+    xa = gen_vsr_ptr(xA(ctx->opcode));
+    xb = gen_vsr_ptr(xB(ctx->opcode));
+    if (ordered) {
+        gen_helper_xscmpodp(tcg_env, opc, xa, xb);
+    } else {
+        gen_helper_xscmpudp(tcg_env, opc, xa, xb);
+    }
+}
+
+static void gen_xscmpodp(DisasContext *ctx)
+{
+    gen_xscmpo_u(ctx, true);
+}
+
+static void gen_xscmpudp(DisasContext *ctx)
+{
+    gen_xscmpo_u(ctx, false);
+}
 GEN_VSX_HELPER_R2_AB(xscmpoqp, 0x04, 0x04, 0, PPC2_VSX)
 GEN_VSX_HELPER_R2_AB(xscmpuqp, 0x04, 0x14, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2(xscvdphp, 0x16, 0x15, 0x11, PPC2_ISA300)
@@ -1198,51 +1369,91 @@ bool trans_XSCVSPDPN(DisasContext *ctx, arg_XX2 *a)
     return true;
 }
 
-GEN_VSX_HELPER_X2(xscvdpsxds, 0x10, 0x15, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xscvdpsxws, 0x10, 0x05, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xscvdpuxds, 0x10, 0x14, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xscvdpuxws, 0x10, 0x04, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xscvsxddp, 0x10, 0x17, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xscvdpsxds, 0x10, 0x15, 0, PPC2_VSX,
+                    VSJ_SI(CVTIZ_(S)))
+GEN_VSX_HELPER_X2_J(xscvdpsxws, 0x10, 0x05, 0, PPC2_VSX,
+                    VSJ_SI(CVTIZ_(S32) | TCG_FPOP_F_DUP32))
+GEN_VSX_HELPER_X2_J(xscvdpuxds, 0x10, 0x14, 0, PPC2_VSX,
+                    VSJ_SI(CVTIZ_(U)))
+GEN_VSX_HELPER_X2_J(xscvdpuxws, 0x10, 0x04, 0, PPC2_VSX,
+                    VSJ_SI(CVTIZ_(U32) | TCG_FPOP_F_DUP32))
+GEN_VSX_HELPER_X2_J(xscvsxddp, 0x10, 0x17, 0, PPC2_VSX,
+                    VSJ_S(TCG_FPOP_CVT_S))
 GEN_VSX_HELPER_R2(xscvudqp, 0x04, 0x1A, 0x02, PPC2_ISA300)
-GEN_VSX_HELPER_X2(xscvuxddp, 0x10, 0x16, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xscvuxddp, 0x10, 0x16, 0, PPC2_VSX,
+                    VSJ_S(TCG_FPOP_CVT_U))
 GEN_VSX_HELPER_X2(xsrdpi, 0x12, 0x04, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xsrdpic, 0x16, 0x06, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xsrdpim, 0x12, 0x07, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xsrdpip, 0x12, 0x06, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xsrdpiz, 0x12, 0x05, 0, PPC2_VSX)
-GEN_VSX_HELPER_XT_XB_ENV(xsrsp, 0x12, 0x11, 0, PPC2_VSX207)
+GEN_VSX_HELPER_X2_J(xsrdpic, 0x16, 0x06, 0, PPC2_VSX,
+                    VSJ_S(RINT_(TCG_FPRND_CURRENT)))
+GEN_VSX_HELPER_X2_J(xsrdpim, 0x12, 0x07, 0, PPC2_VSX,
+                    VSJ_S(RINT_(TCG_FPRND_DOWN)))
+GEN_VSX_HELPER_X2_J(xsrdpip, 0x12, 0x06, 0, PPC2_VSX,
+                    VSJ_S(RINT_(TCG_FPRND_UP)))
+GEN_VSX_HELPER_X2_J(xsrdpiz, 0x12, 0x05, 0, PPC2_VSX,
+                    VSJ_S(RINT_(TCG_FPRND_ZERO)))
+static void gen_xsrsp(DisasContext *ctx)
+{
+    TCGv_i64 t0, t1;
+    if (unlikely(!ctx->vsx_enabled)) {
+        gen_exception(ctx, POWERPC_EXCP_VSXU);
+        return;
+    }
+    if (vsj_op1(ctx, xT(ctx->opcode), xB(ctx->opcode),
+                VSJ_S(TCG_FPOP_RND_SP))) {
+        return;
+    }
+    t0 = tcg_temp_new_i64();
+    t1 = tcg_temp_new_i64();
+    get_cpu_vsr(t0, xB(ctx->opcode), true);
+    gen_helper_xsrsp(t1, tcg_env, t0);
+    set_cpu_vsr(xT(ctx->opcode), t1, true);
+    set_cpu_vsr(xT(ctx->opcode), tcg_constant_i64(0), false);
+}
 GEN_VSX_HELPER_R2(xsrqpi, 0x05, 0x00, 0, PPC2_ISA300)
 GEN_VSX_HELPER_R2(xsrqpxp, 0x05, 0x01, 0, PPC2_ISA300)
 GEN_VSX_HELPER_R2(xssqrtqp, 0x04, 0x19, 0x1B, PPC2_ISA300)
 GEN_VSX_HELPER_R3(xssubqp, 0x04, 0x10, 0, PPC2_ISA300)
 GEN_VSX_HELPER_X2(xsresp, 0x14, 0x01, 0, PPC2_VSX207)
-GEN_VSX_HELPER_X2(xssqrtsp, 0x16, 0x00, 0, PPC2_VSX207)
+GEN_VSX_HELPER_X2_J(xssqrtsp, 0x16, 0x00, 0, PPC2_VSX207,
+                    VSJ_S(SPNAN_(SQRT)))
 GEN_VSX_HELPER_X2(xsrsqrtesp, 0x14, 0x00, 0, PPC2_VSX207)
-GEN_VSX_HELPER_X2(xscvsxdsp, 0x10, 0x13, 0, PPC2_VSX207)
-GEN_VSX_HELPER_X2(xscvuxdsp, 0x10, 0x12, 0, PPC2_VSX207)
+GEN_VSX_HELPER_X2_J(xscvsxdsp, 0x10, 0x13, 0, PPC2_VSX207,
+                    VSJ_S(TCG_FPOP_CVT_S | SP_))
+GEN_VSX_HELPER_X2_J(xscvuxdsp, 0x10, 0x12, 0, PPC2_VSX207,
+                    VSJ_S(TCG_FPOP_CVT_U | SP_))
 
 GEN_VSX_HELPER_X2(xvredp, 0x14, 0x0D, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvsqrtdp, 0x16, 0x0C, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvsqrtdp, 0x16, 0x0C, 0, PPC2_VSX,
+                    VSJ_VD(DEFNAN_(SQRT)))
 GEN_VSX_HELPER_X2(xvrsqrtedp, 0x14, 0x0C, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2_AB(xvtdivdp, 0x14, 0x0F, 0, PPC2_VSX)
 GEN_VSX_HELPER_X1(xvtsqrtdp, 0x14, 0x0E, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2(xvcvdpsp, 0x12, 0x18, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvcvdpsxds, 0x10, 0x1D, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvcvdpsxds, 0x10, 0x1D, 0, PPC2_VSX,
+                    VSJ_VD(CVTIZ_(S)))
 GEN_VSX_HELPER_X2(xvcvdpsxws, 0x10, 0x0D, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvcvdpuxds, 0x10, 0x1C, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvcvdpuxds, 0x10, 0x1C, 0, PPC2_VSX,
+                    VSJ_VD(CVTIZ_(U)))
 GEN_VSX_HELPER_X2(xvcvdpuxws, 0x10, 0x0C, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvcvsxddp, 0x10, 0x1F, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvcvuxddp, 0x10, 0x1E, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvcvsxddp, 0x10, 0x1F, 0, PPC2_VSX,
+                    VSJ_VD(TCG_FPOP_CVT_S))
+GEN_VSX_HELPER_X2_J(xvcvuxddp, 0x10, 0x1E, 0, PPC2_VSX,
+                    VSJ_VD(TCG_FPOP_CVT_U))
 GEN_VSX_HELPER_X2(xvcvsxwdp, 0x10, 0x0F, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2(xvcvuxwdp, 0x10, 0x0E, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2(xvrdpi, 0x12, 0x0C, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvrdpic, 0x16, 0x0E, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvrdpim, 0x12, 0x0F, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvrdpip, 0x12, 0x0E, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvrdpiz, 0x12, 0x0D, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvrdpic, 0x16, 0x0E, 0, PPC2_VSX,
+                    VSJ_VD(RINT_(TCG_FPRND_CURRENT)))
+GEN_VSX_HELPER_X2_J(xvrdpim, 0x12, 0x0F, 0, PPC2_VSX,
+                    VSJ_VD(RINT_(TCG_FPRND_DOWN)))
+GEN_VSX_HELPER_X2_J(xvrdpip, 0x12, 0x0E, 0, PPC2_VSX,
+                    VSJ_VD(RINT_(TCG_FPRND_UP)))
+GEN_VSX_HELPER_X2_J(xvrdpiz, 0x12, 0x0D, 0, PPC2_VSX,
+                    VSJ_VD(RINT_(TCG_FPRND_ZERO)))
 
 GEN_VSX_HELPER_X2(xvresp, 0x14, 0x09, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvsqrtsp, 0x16, 0x08, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvsqrtsp, 0x16, 0x08, 0, PPC2_VSX,
+                    VSJ_VW(DEFNAN_(SQRT)))
 GEN_VSX_HELPER_X2(xvrsqrtesp, 0x14, 0x08, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2_AB(xvtdivsp, 0x14, 0x0B, 0, PPC2_VSX)
 GEN_VSX_HELPER_X1(xvtsqrtsp, 0x14, 0x0A, 0, PPC2_VSX)
@@ -1250,18 +1461,26 @@ GEN_VSX_HELPER_X2(xvcvspdp, 0x12, 0x1C, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2(xvcvhpsp, 0x16, 0x1D, 0x18, PPC2_ISA300)
 GEN_VSX_HELPER_X2(xvcvsphp, 0x16, 0x1D, 0x19, PPC2_ISA300)
 GEN_VSX_HELPER_X2(xvcvspsxds, 0x10, 0x19, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvcvspsxws, 0x10, 0x09, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvcvspsxws, 0x10, 0x09, 0, PPC2_VSX,
+                    VSJ_VW(CVTIZ_(S)))
 GEN_VSX_HELPER_X2(xvcvspuxds, 0x10, 0x18, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvcvspuxws, 0x10, 0x08, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvcvspuxws, 0x10, 0x08, 0, PPC2_VSX,
+                    VSJ_VW(CVTIZ_(U)))
 GEN_VSX_HELPER_X2(xvcvsxdsp, 0x10, 0x1B, 0, PPC2_VSX)
 GEN_VSX_HELPER_X2(xvcvuxdsp, 0x10, 0x1A, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvcvsxwsp, 0x10, 0x0B, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvcvuxwsp, 0x10, 0x0A, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvcvsxwsp, 0x10, 0x0B, 0, PPC2_VSX,
+                    VSJ_VW(TCG_FPOP_CVT_S))
+GEN_VSX_HELPER_X2_J(xvcvuxwsp, 0x10, 0x0A, 0, PPC2_VSX,
+                    VSJ_VW(TCG_FPOP_CVT_U))
 GEN_VSX_HELPER_X2(xvrspi, 0x12, 0x08, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvrspic, 0x16, 0x0A, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvrspim, 0x12, 0x0B, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvrspip, 0x12, 0x0A, 0, PPC2_VSX)
-GEN_VSX_HELPER_X2(xvrspiz, 0x12, 0x09, 0, PPC2_VSX)
+GEN_VSX_HELPER_X2_J(xvrspic, 0x16, 0x0A, 0, PPC2_VSX,
+                    VSJ_VW(RINT_(TCG_FPRND_CURRENT)))
+GEN_VSX_HELPER_X2_J(xvrspim, 0x12, 0x0B, 0, PPC2_VSX,
+                    VSJ_VW(RINT_(TCG_FPRND_DOWN)))
+GEN_VSX_HELPER_X2_J(xvrspip, 0x12, 0x0A, 0, PPC2_VSX,
+                    VSJ_VW(RINT_(TCG_FPRND_UP)))
+GEN_VSX_HELPER_X2_J(xvrspiz, 0x12, 0x09, 0, PPC2_VSX,
+                    VSJ_VW(RINT_(TCG_FPRND_ZERO)))
 
 static bool trans_XXPERM(DisasContext *ctx, arg_XX3 *a)
 {
@@ -1391,32 +1610,50 @@ static bool do_xsmadd(DisasContext *ctx, int tgt, int src1, int src2, int src3,
 }
 
 static bool do_xsmadd_XX3(DisasContext *ctx, arg_XX3 *a, bool type_a,
-        void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))
+        void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr),
+        unsigned fpop)
 {
     REQUIRE_VSX(ctx);
 
+    /* A form: xt = xa * xb + xt; M form: xt = xa * xt + xb */
+    if (vsj_fma(ctx, a->xt, a->xa, type_a ? a->xb : a->xt,
+                type_a ? a->xt : a->xb, fpop, TCG_TYPE_V64, MO_64, FPJ_FPRF)) {
+        return true;
+    }
     if (type_a) {
         return do_xsmadd(ctx, a->xt, a->xa, a->xt, a->xb, gen_helper);
     }
     return do_xsmadd(ctx, a->xt, a->xa, a->xb, a->xt, gen_helper);
 }
 
-TRANS_FLAGS2(VSX, XSMADDADP, do_xsmadd_XX3, true, gen_helper_XSMADDDP)
-TRANS_FLAGS2(VSX, XSMADDMDP, do_xsmadd_XX3, false, gen_helper_XSMADDDP)
-TRANS_FLAGS2(VSX, XSMSUBADP, do_xsmadd_XX3, true, gen_helper_XSMSUBDP)
-TRANS_FLAGS2(VSX, XSMSUBMDP, do_xsmadd_XX3, false, gen_helper_XSMSUBDP)
-TRANS_FLAGS2(VSX, XSNMADDADP, do_xsmadd_XX3, true, gen_helper_XSNMADDDP)
-TRANS_FLAGS2(VSX, XSNMADDMDP, do_xsmadd_XX3, false, gen_helper_XSNMADDDP)
-TRANS_FLAGS2(VSX, XSNMSUBADP, do_xsmadd_XX3, true, gen_helper_XSNMSUBDP)
-TRANS_FLAGS2(VSX, XSNMSUBMDP, do_xsmadd_XX3, false, gen_helper_XSNMSUBDP)
-TRANS_FLAGS2(VSX207, XSMADDASP, do_xsmadd_XX3, true, gen_helper_XSMADDSP)
-TRANS_FLAGS2(VSX207, XSMADDMSP, do_xsmadd_XX3, false, gen_helper_XSMADDSP)
-TRANS_FLAGS2(VSX207, XSMSUBASP, do_xsmadd_XX3, true, gen_helper_XSMSUBSP)
-TRANS_FLAGS2(VSX207, XSMSUBMSP, do_xsmadd_XX3, false, gen_helper_XSMSUBSP)
-TRANS_FLAGS2(VSX207, XSNMADDASP, do_xsmadd_XX3, true, gen_helper_XSNMADDSP)
-TRANS_FLAGS2(VSX207, XSNMADDMSP, do_xsmadd_XX3, false, gen_helper_XSNMADDSP)
-TRANS_FLAGS2(VSX207, XSNMSUBASP, do_xsmadd_XX3, true, gen_helper_XSNMSUBSP)
-TRANS_FLAGS2(VSX207, XSNMSUBMSP, do_xsmadd_XX3, false, gen_helper_XSNMSUBSP)
+/* nmadd, nmsub negate the rounded result, as the ISA says */
+#define MSUB_           TCG_FPOP_F_NEG_ADD
+#define NMADD_          TCG_FPOP_F_NEG_RES
+#define NMSUB_          (TCG_FPOP_F_NEG_ADD | TCG_FPOP_F_NEG_RES)
+TRANS_FLAGS2(VSX, XSMADDADP, do_xsmadd_XX3, true, gen_helper_XSMADDDP, 0)
+TRANS_FLAGS2(VSX, XSMADDMDP, do_xsmadd_XX3, false, gen_helper_XSMADDDP, 0)
+TRANS_FLAGS2(VSX, XSMSUBADP, do_xsmadd_XX3, true, gen_helper_XSMSUBDP, MSUB_)
+TRANS_FLAGS2(VSX, XSMSUBMDP, do_xsmadd_XX3, false, gen_helper_XSMSUBDP, MSUB_)
+TRANS_FLAGS2(VSX, XSNMADDADP, do_xsmadd_XX3, true, gen_helper_XSNMADDDP, NMADD_)
+TRANS_FLAGS2(VSX, XSNMADDMDP, do_xsmadd_XX3, false, gen_helper_XSNMADDDP,
+             NMADD_)
+TRANS_FLAGS2(VSX, XSNMSUBADP, do_xsmadd_XX3, true, gen_helper_XSNMSUBDP, NMSUB_)
+TRANS_FLAGS2(VSX, XSNMSUBMDP, do_xsmadd_XX3, false, gen_helper_XSNMSUBDP,
+             NMSUB_)
+TRANS_FLAGS2(VSX207, XSMADDASP, do_xsmadd_XX3, true, gen_helper_XSMADDSP, SP_)
+TRANS_FLAGS2(VSX207, XSMADDMSP, do_xsmadd_XX3, false, gen_helper_XSMADDSP, SP_)
+TRANS_FLAGS2(VSX207, XSMSUBASP, do_xsmadd_XX3, true, gen_helper_XSMSUBSP,
+             MSUB_ | SP_)
+TRANS_FLAGS2(VSX207, XSMSUBMSP, do_xsmadd_XX3, false, gen_helper_XSMSUBSP,
+             MSUB_ | SP_)
+TRANS_FLAGS2(VSX207, XSNMADDASP, do_xsmadd_XX3, true, gen_helper_XSNMADDSP,
+             NMADD_ | SP_)
+TRANS_FLAGS2(VSX207, XSNMADDMSP, do_xsmadd_XX3, false, gen_helper_XSNMADDSP,
+             NMADD_ | SP_)
+TRANS_FLAGS2(VSX207, XSNMSUBASP, do_xsmadd_XX3, true, gen_helper_XSNMSUBSP,
+             NMSUB_ | SP_)
+TRANS_FLAGS2(VSX207, XSNMSUBMSP, do_xsmadd_XX3, false, gen_helper_XSNMSUBSP,
+             NMSUB_ | SP_)
 
 static bool do_xsmadd_X(DisasContext *ctx, arg_X_rc *a,
         void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr),
@@ -1443,12 +1680,20 @@ TRANS(XSMSUBQP, do_xsmadd_X, gen_helper_XSMSUBQP, gen_helper_XSMSUBQPO)
 TRANS(XSNMADDQP, do_xsmadd_X, gen_helper_XSNMADDQP, gen_helper_XSNMADDQPO)
 TRANS(XSNMSUBQP, do_xsmadd_X, gen_helper_XSNMSUBQP, gen_helper_XSNMSUBQPO)
 
-#define GEN_VSX_HELPER_VSX_MADD(name, op1, aop, mop, inval, type)             \
+#define GEN_VSX_HELPER_VSX_MADD(name, op1, aop, mop, inval, type, fpop, vece) \
 static void gen_##name(DisasContext *ctx)                                     \
 {                                                                             \
     TCGv_ptr xt, s1, s2, s3;                                                  \
+    bool m = ctx->opcode & PPC_BIT32(25);                                     \
     if (unlikely(!ctx->vsx_enabled)) {                                        \
         gen_exception(ctx, POWERPC_EXCP_VSXU);                                \
+        return;                                                               \
+    }                                                                         \
+    /* M form: xt = xa * xt + xb; A form: xt = xa * xb + xt */                \
+    if (vsj_fma(ctx, xT(ctx->opcode), xA(ctx->opcode),                        \
+                m ? xT(ctx->opcode) : xB(ctx->opcode),                        \
+                m ? xB(ctx->opcode) : xT(ctx->opcode),                        \
+                fpop, TCG_TYPE_V128, vece, FPJ_FLAGS)) {                      \
         return;                                                               \
     }                                                                         \
     xt = gen_vsr_ptr(xT(ctx->opcode));                                        \
@@ -1469,14 +1714,14 @@ static void gen_##name(DisasContext *ctx)                                     \
     gen_helper_##name(tcg_env, xt, s1, s2, s3);                               \
 }
 
-GEN_VSX_HELPER_VSX_MADD(xvmadddp, 0x04, 0x0C, 0x0D, 0, PPC2_VSX)
-GEN_VSX_HELPER_VSX_MADD(xvmsubdp, 0x04, 0x0E, 0x0F, 0, PPC2_VSX)
-GEN_VSX_HELPER_VSX_MADD(xvnmadddp, 0x04, 0x1C, 0x1D, 0, PPC2_VSX)
-GEN_VSX_HELPER_VSX_MADD(xvnmsubdp, 0x04, 0x1E, 0x1F, 0, PPC2_VSX)
-GEN_VSX_HELPER_VSX_MADD(xvmaddsp, 0x04, 0x08, 0x09, 0, PPC2_VSX)
-GEN_VSX_HELPER_VSX_MADD(xvmsubsp, 0x04, 0x0A, 0x0B, 0, PPC2_VSX)
-GEN_VSX_HELPER_VSX_MADD(xvnmaddsp, 0x04, 0x18, 0x19, 0, PPC2_VSX)
-GEN_VSX_HELPER_VSX_MADD(xvnmsubsp, 0x04, 0x1A, 0x1B, 0, PPC2_VSX)
+GEN_VSX_HELPER_VSX_MADD(xvmadddp, 0x04, 0x0C, 0x0D, 0, PPC2_VSX, 0, MO_64)
+GEN_VSX_HELPER_VSX_MADD(xvmsubdp, 0x04, 0x0E, 0x0F, 0, PPC2_VSX, MSUB_, MO_64)
+GEN_VSX_HELPER_VSX_MADD(xvnmadddp, 0x04, 0x1C, 0x1D, 0, PPC2_VSX, NMADD_, MO_64)
+GEN_VSX_HELPER_VSX_MADD(xvnmsubdp, 0x04, 0x1E, 0x1F, 0, PPC2_VSX, NMSUB_, MO_64)
+GEN_VSX_HELPER_VSX_MADD(xvmaddsp, 0x04, 0x08, 0x09, 0, PPC2_VSX, 0, MO_32)
+GEN_VSX_HELPER_VSX_MADD(xvmsubsp, 0x04, 0x0A, 0x0B, 0, PPC2_VSX, MSUB_, MO_32)
+GEN_VSX_HELPER_VSX_MADD(xvnmaddsp, 0x04, 0x18, 0x19, 0, PPC2_VSX, NMADD_, MO_32)
+GEN_VSX_HELPER_VSX_MADD(xvnmsubsp, 0x04, 0x1A, 0x1B, 0, PPC2_VSX, NMSUB_, MO_32)
 
 static void gen_xxbrd(DisasContext *ctx)
 {
@@ -2674,33 +2919,78 @@ static bool do_helper_XX3(DisasContext *ctx, arg_XX3 *a,
     return true;
 }
 
-TRANS_FLAGS2(ISA300, XSCMPEQDP, do_helper_XX3, gen_helper_XSCMPEQDP)
-TRANS_FLAGS2(ISA300, XSCMPGEDP, do_helper_XX3, gen_helper_XSCMPGEDP)
-TRANS_FLAGS2(ISA300, XSCMPGTDP, do_helper_XX3, gen_helper_XSCMPGTDP)
-TRANS_FLAGS2(ISA300, XSMAXCDP, do_helper_XX3, gen_helper_XSMAXCDP)
-TRANS_FLAGS2(ISA300, XSMINCDP, do_helper_XX3, gen_helper_XSMINCDP)
+/* do_helper_XX3() with a host FP version, see vsj_op2() */
+static bool do_vsj_XX3(DisasContext *ctx, arg_XX3 *a,
+                       void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr),
+                       unsigned fpop, TCGType type, unsigned vece, FPJRes res)
+{
+    REQUIRE_VSX(ctx);
+    if (vsj_op2(ctx, a->xt, a->xa, a->xb, fpop, type, vece, res)) {
+        return true;
+    }
+    return do_helper_XX3(ctx, a, helper);
+}
+
+/*
+ * xsmaxcdp: xb <= xa ? xa : xb; xsmincdp: xa < xb ? xa : xb, as the
+ * helpers do; a quiet compare, whose SNaN operands are invalid.
+ */
+static bool do_vsj_maxmin_c(DisasContext *ctx, arg_XX3 *a,
+                            void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr,
+                                           TCGv_ptr), bool max)
+{
+    unsigned fpop = TCG_FPOP_CMP | TCG_FPOP_PRED(max ? TCG_FPPRED_LE
+                                                     : TCG_FPPRED_LT);
+    TCGv_vec va, vb, m;
+
+    REQUIRE_VSX(ctx);
+    if (!vsj_ok(ctx, fpop, TCG_TYPE_V64, MO_64)) {
+        return do_helper_XX3(ctx, a, helper);
+    }
+    va = vsj_ld(TCG_TYPE_V64, a->xa);
+    vb = vsj_ld(TCG_TYPE_V64, a->xb);
+    m = tcg_temp_new_vec(TCG_TYPE_V64);
+    if (max) {
+        tcg_gen_fpop2_vec(MO_64, m, vb, va, fpop);
+    } else {
+        tcg_gen_fpop2_vec(MO_64, m, va, vb, fpop);
+    }
+    tcg_gen_bitsel_vec(MO_64, m, m, va, vb);
+    vsj_st(TCG_TYPE_V64, a->xt, m, FPJ_FLAGS);
+    return true;
+}
+
+/* scalar compares: an all-ones or zero doubleword 0 */
+TRANS_FLAGS2(ISA300, XSCMPEQDP, do_vsj_XX3, gen_helper_XSCMPEQDP,
+             VSJ_SF(TCG_FPOP_CMP | VSJ_CMP(EQ)))
+TRANS_FLAGS2(ISA300, XSCMPGEDP, do_vsj_XX3, gen_helper_XSCMPGEDP,
+             VSJ_SF(TCG_FPOP_CMP | VSJ_CMPS(GE)))
+TRANS_FLAGS2(ISA300, XSCMPGTDP, do_vsj_XX3, gen_helper_XSCMPGTDP,
+             VSJ_SF(TCG_FPOP_CMP | VSJ_CMPS(GT)))
+TRANS_FLAGS2(ISA300, XSMAXCDP, do_vsj_maxmin_c, gen_helper_XSMAXCDP, true)
+TRANS_FLAGS2(ISA300, XSMINCDP, do_vsj_maxmin_c, gen_helper_XSMINCDP, false)
 TRANS_FLAGS2(ISA300, XSMAXJDP, do_helper_XX3, gen_helper_XSMAXJDP)
 TRANS_FLAGS2(ISA300, XSMINJDP, do_helper_XX3, gen_helper_XSMINJDP)
 
-TRANS_FLAGS2(VSX207, XSADDSP, do_helper_XX3, gen_helper_XSADDSP)
-TRANS_FLAGS2(VSX207, XSSUBSP, do_helper_XX3, gen_helper_XSSUBSP)
-TRANS_FLAGS2(VSX207, XSMULSP, do_helper_XX3, gen_helper_XSMULSP)
-TRANS_FLAGS2(VSX207, XSDIVSP, do_helper_XX3, gen_helper_XSDIVSP)
+TRANS_FLAGS2(VSX207, XSADDSP, do_vsj_XX3, gen_helper_XSADDSP, VSJ_S(SPNAN_(ADD)))
+TRANS_FLAGS2(VSX207, XSSUBSP, do_vsj_XX3, gen_helper_XSSUBSP, VSJ_S(SPNAN_(SUB)))
+TRANS_FLAGS2(VSX207, XSMULSP, do_vsj_XX3, gen_helper_XSMULSP, VSJ_S(SPNAN_(MUL)))
+TRANS_FLAGS2(VSX207, XSDIVSP, do_vsj_XX3, gen_helper_XSDIVSP, VSJ_S(SPNAN_(DIV)))
 
-TRANS_FLAGS2(VSX, XSADDDP, do_helper_XX3, gen_helper_XSADDDP)
-TRANS_FLAGS2(VSX, XSSUBDP, do_helper_XX3, gen_helper_XSSUBDP)
-TRANS_FLAGS2(VSX, XSMULDP, do_helper_XX3, gen_helper_XSMULDP)
-TRANS_FLAGS2(VSX, XSDIVDP, do_helper_XX3, gen_helper_XSDIVDP)
+TRANS_FLAGS2(VSX, XSADDDP, do_vsj_XX3, gen_helper_XSADDDP, VSJ_S(DEFNAN_(ADD)))
+TRANS_FLAGS2(VSX, XSSUBDP, do_vsj_XX3, gen_helper_XSSUBDP, VSJ_S(DEFNAN_(SUB)))
+TRANS_FLAGS2(VSX, XSMULDP, do_vsj_XX3, gen_helper_XSMULDP, VSJ_S(DEFNAN_(MUL)))
+TRANS_FLAGS2(VSX, XSDIVDP, do_vsj_XX3, gen_helper_XSDIVDP, VSJ_S(DEFNAN_(DIV)))
 
-TRANS_FLAGS2(VSX, XVADDSP, do_helper_XX3, gen_helper_XVADDSP)
-TRANS_FLAGS2(VSX, XVSUBSP, do_helper_XX3, gen_helper_XVSUBSP)
-TRANS_FLAGS2(VSX, XVMULSP, do_helper_XX3, gen_helper_XVMULSP)
-TRANS_FLAGS2(VSX, XVDIVSP, do_helper_XX3, gen_helper_XVDIVSP)
+TRANS_FLAGS2(VSX, XVADDSP, do_vsj_XX3, gen_helper_XVADDSP, VSJ_VW(DEFNAN_(ADD)))
+TRANS_FLAGS2(VSX, XVSUBSP, do_vsj_XX3, gen_helper_XVSUBSP, VSJ_VW(DEFNAN_(SUB)))
+TRANS_FLAGS2(VSX, XVMULSP, do_vsj_XX3, gen_helper_XVMULSP, VSJ_VW(DEFNAN_(MUL)))
+TRANS_FLAGS2(VSX, XVDIVSP, do_vsj_XX3, gen_helper_XVDIVSP, VSJ_VW(DEFNAN_(DIV)))
 
-TRANS_FLAGS2(VSX, XVADDDP, do_helper_XX3, gen_helper_XVADDDP)
-TRANS_FLAGS2(VSX, XVSUBDP, do_helper_XX3, gen_helper_XVSUBDP)
-TRANS_FLAGS2(VSX, XVMULDP, do_helper_XX3, gen_helper_XVMULDP)
-TRANS_FLAGS2(VSX, XVDIVDP, do_helper_XX3, gen_helper_XVDIVDP)
+TRANS_FLAGS2(VSX, XVADDDP, do_vsj_XX3, gen_helper_XVADDDP, VSJ_VD(DEFNAN_(ADD)))
+TRANS_FLAGS2(VSX, XVSUBDP, do_vsj_XX3, gen_helper_XVSUBDP, VSJ_VD(DEFNAN_(SUB)))
+TRANS_FLAGS2(VSX, XVMULDP, do_vsj_XX3, gen_helper_XVMULDP, VSJ_VD(DEFNAN_(MUL)))
+TRANS_FLAGS2(VSX, XVDIVDP, do_vsj_XX3, gen_helper_XVDIVDP, VSJ_VD(DEFNAN_(DIV)))
 
 TRANS_FLAGS2(VSX, XSMAXDP, do_helper_XX3, gen_helper_XSMAXDP)
 TRANS_FLAGS2(VSX, XSMINDP, do_helper_XX3, gen_helper_XSMINDP)

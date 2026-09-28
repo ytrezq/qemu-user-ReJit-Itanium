@@ -1374,12 +1374,15 @@ struct CPUArchState {
      * FP instructions compiled to host FP code (TCG fpop ops) leave their
      * exception flags in the host FP status register and their FPRF in
      * fprf_val; ppc_fpscr_sync() folds both into fpscr.  fprf_lazy holds
-     * PPC_FPRF_LAZY_* bits saying what is pending, fp_host_used is set by
-     * the other ones: while both are 0 there is nothing to fold.
+     * PPC_FPRF_LAZY_* bits saying what is pending.  The instructions that
+     * do not set FPRF set fp_host_fi if they set FI, like conversions,
+     * or else fp_host_used, like vector instructions.  While all three
+     * are 0 there is nothing to fold.
      */
     uint64_t fprf_val;
     uint32_t fprf_lazy;
     uint32_t fp_host_used;
+    uint32_t fp_host_fi;
 
     /* Internal devices resources */
     ppc_tb_t *tb_env;      /* Time base and decrementer */

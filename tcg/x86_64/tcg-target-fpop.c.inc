@@ -122,6 +122,7 @@ static const uint8_t fpo_cmp_pred[][2] = {
     [TCG_FPPRED_GE]    = { 0x1d, 0x0d },  /* GE_OQ, GE_OS */
     [TCG_FPPRED_UNORD] = { 0x03, 0x13 },  /* UNORD_Q, UNORD_S */
     [TCG_FPPRED_NE]    = { 0x04, 0x14 },  /* NEQ_UQ, NEQ_US */
+    [TCG_FPPRED_LTGT]  = { 0x0c, 0x1c },  /* NEQ_OQ, NEQ_OS */
 };
 #define FPO_PRED_UNORD_Q    0x03
 #define FPO_PRED_UNORD_S    0x13
@@ -687,7 +688,7 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
                 [TCG_FPRND_DOWN] = 0x09,
                 [TCG_FPRND_UP] = 0x0a,
                 [TCG_FPRND_ZERO] = 0x0b,
-                [TCG_FPRND_CURRENT] = 0x0c,
+                [TCG_FPRND_CURRENT] = 0x04,
             };
             uint8_t imm = mode[TCG_FPOP_GET_RMODE(fpop)];
             if (scalar) {
@@ -773,6 +774,11 @@ static void tcg_out_fpop1(TCGContext *s, TCGType type, unsigned vece,
             fpo_rrr(s, opc, d, 0, a, kl, true);
             if (sat) {
                 fpo_cvti_sat(s, d, a, true, true, !u, 32, kl, trunc);
+            }
+            if (fpop & TCG_FPOP_F_DUP32) {
+                /* vpshufd d, d, 0: dword 0 everywhere */
+                fpo_rrri(s, 0x70 | P_EXT | P_DATA16, d, 0, d, 0, false, 0);
+                return;
             }
             fpo_rrr(s, u ? FPO_PMOVZXDQ : FPO_PMOVSXDQ, d, 0, d, 0, false);
             if (sat && !u) {

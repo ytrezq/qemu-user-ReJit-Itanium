@@ -41,7 +41,8 @@ typedef enum TCGFPOp {
     TCG_FPOP_SQRT,
     TCG_FPOP_RECIP,     /* 1 / a */
     TCG_FPOP_RSQRT,     /* 1 / sqrt(a), with two roundings */
-    TCG_FPOP_RINT,      /* round to integral, TCG_FPOP_RMODE, never inexact */
+    TCG_FPOP_RINT,      /* round to integral, TCG_FPOP_RMODE; inexact only
+                           with TCG_FPRND_CURRENT */
     TCG_FPOP_RND_SP,    /* MO_64 only: round to binary32 precision */
     TCG_FPOP_CVT_S,     /* signed integer element -> fp of the same size */
     TCG_FPOP_CVT_U,     /* unsigned integer element -> fp of the same size */
@@ -85,6 +86,8 @@ typedef enum TCGFPOp {
 #define TCG_FPOP_F_PPC_SAT      (1u << 15)
 /* CMP and fpcmpcc: signalling compare (invalid for any NaN operand). */
 #define TCG_FPOP_F_SIGNAL       (1u << 16)
+/* CVTI_S32, CVTI_U32: the 32-bit result in both halves of the element. */
+#define TCG_FPOP_F_DUP32        (1u << 17)
 
 /* CMP predicates */
 typedef enum TCGFPPred {
@@ -95,6 +98,7 @@ typedef enum TCGFPPred {
     TCG_FPPRED_GE,      /* a >= b */
     TCG_FPPRED_UNORD,   /* a or b is NaN */
     TCG_FPPRED_NE,      /* !(a == b), true if unordered */
+    TCG_FPPRED_LTGT,    /* a < b || a > b, false if unordered */
 } TCGFPPred;
 
 #define TCG_FPOP_PRED(p)        ((unsigned)(p) << 20)
@@ -106,7 +110,7 @@ typedef enum TCGFPRound {
     TCG_FPRND_DOWN,
     TCG_FPRND_UP,
     TCG_FPRND_ZERO,
-    TCG_FPRND_CURRENT,      /* host control register */
+    TCG_FPRND_CURRENT,      /* host control register, may be inexact */
 } TCGFPRound;
 
 #define TCG_FPOP_RMODE(m)       ((unsigned)(m) << 24)

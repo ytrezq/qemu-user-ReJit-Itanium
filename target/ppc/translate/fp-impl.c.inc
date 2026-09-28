@@ -53,17 +53,41 @@ static void fpj_set_fprf(TCGv_vec v)
                    offsetof(CPUPPCState, fprf_lazy));
 }
 
-static void fpj_st(int reg, TCGv_vec v, bool set_fprf)
+/* What an instruction leaves to fold into FPSCR, see CPUPPCState */
+typedef enum FPJRes {
+    FPJ_FLAGS,          /* exception flags only */
+    FPJ_FI,             /* exception flags and FI */
+    FPJ_FPRF,           /* exception flags, FI and FPRF */
+} FPJRes;
+
+static void fpj_mark(TCGv_vec v, FPJRes res)
 {
-    tcg_gen_st_vec(v, tcg_env, fpr_offset(reg));
-    /* doubleword 1 of the VSR is 0, as set_fpr() does */
-    tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(reg, false));
-    if (set_fprf) {
+    switch (res) {
+    case FPJ_FPRF:
         fpj_set_fprf(v);
-    } else {
+        break;
+    case FPJ_FI:
+        tcg_gen_st_i32(tcg_constant_i32(1), tcg_env,
+                       offsetof(CPUPPCState, fp_host_fi));
+        break;
+    case FPJ_FLAGS:
         tcg_gen_st_i32(tcg_constant_i32(1), tcg_env,
                        offsetof(CPUPPCState, fp_host_used));
+        break;
     }
+}
+
+/* FPR or scalar VSX result: doubleword 0, and doubleword 1 is 0 */
+static void fpj_st_res(int reg, TCGv_vec v, FPJRes res)
+{
+    tcg_gen_st_vec(v, tcg_env, fpr_offset(reg));
+    tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(reg, false));
+    fpj_mark(v, res);
+}
+
+static void fpj_st(int reg, TCGv_vec v, bool set_fprf)
+{
+    fpj_st_res(reg, v, set_fprf ? FPJ_FPRF : FPJ_FI);
 }
 
 static bool do_fpj_2(DisasContext *ctx, int t, int a, int b, bool rc,
@@ -453,6 +477,24 @@ static bool trans_FTSQRT(DisasContext *ctx, arg_X_bf_b *a)
 }
 
 /***                         Floating-Point compare                        ***/
+/* CR field bf and FPSCR[FPCC] = compare of FPRs/VSRs ra and rb */
+static void gen_fpj_cmp(int ra, int rb, int bf, bool ordered)
+{
+    TCGv_vec va = fpj_ld(ra);
+    TCGv_vec vb = fpj_ld(rb);
+    TCGv_i32 lazy = tcg_temp_new_i32();
+    TCGv t = tcg_temp_new();
+
+    tcg_gen_fpcmpcc_vec(MO_64, cpu_crf[bf], va, vb,
+                        ordered ? TCG_FPOP_F_SIGNAL : 0);
+    /* FPSCR[FPCC] = CR field, the class bit C is left alone */
+    tcg_gen_extu_i32_tl(t, cpu_crf[bf]);
+    tcg_gen_deposit_tl(cpu_fpscr, cpu_fpscr, t, FPSCR_FPCC, 4);
+    tcg_gen_ld_i32(lazy, tcg_env, offsetof(CPUPPCState, fprf_lazy));
+    tcg_gen_ori_i32(lazy, lazy, PPC_FPRF_LAZY_FPCC);
+    tcg_gen_st_i32(lazy, tcg_env, offsetof(CPUPPCState, fprf_lazy));
+}
+
 static bool do_helper_cmp(DisasContext *ctx, arg_X_bf *a,
                           void (*helper)(TCGv_env, TCGv_i64, TCGv_i64,
                                          TCGv_i32), bool ordered)
@@ -462,19 +504,7 @@ static bool do_helper_cmp(DisasContext *ctx, arg_X_bf *a,
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
     if (ctx->fp_jit) {
-        TCGv_vec va = fpj_ld(a->ra);
-        TCGv_vec vb = fpj_ld(a->rb);
-        TCGv_i32 lazy = tcg_temp_new_i32();
-        TCGv t = tcg_temp_new();
-
-        tcg_gen_fpcmpcc_vec(MO_64, cpu_crf[a->bf], va, vb,
-                            ordered ? TCG_FPOP_F_SIGNAL : 0);
-        /* FPSCR[FPCC] = CR field, the class bit C is left alone */
-        tcg_gen_extu_i32_tl(t, cpu_crf[a->bf]);
-        tcg_gen_deposit_tl(cpu_fpscr, cpu_fpscr, t, FPSCR_FPCC, 4);
-        tcg_gen_ld_i32(lazy, tcg_env, offsetof(CPUPPCState, fprf_lazy));
-        tcg_gen_ori_i32(lazy, lazy, PPC_FPRF_LAZY_FPCC);
-        tcg_gen_st_i32(lazy, tcg_env, offsetof(CPUPPCState, fprf_lazy));
+        gen_fpj_cmp(a->ra, a->rb, a->bf, ordered);
         return true;
     }
     t0 = tcg_temp_new_i64();

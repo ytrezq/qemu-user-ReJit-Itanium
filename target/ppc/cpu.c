@@ -262,6 +262,7 @@ void ppc_store_fpscr(CPUPPCState *env, target_ulong val)
          */
         env->fprf_lazy = 0;
         env->fp_host_used = 0;
+        env->fp_host_fi = 0;
 #ifdef PPC_HOST_FPENV
         ppc_host_fp_set(ppc_host_fp_get() & ~PPC_HOST_FLAGS);
 #endif
