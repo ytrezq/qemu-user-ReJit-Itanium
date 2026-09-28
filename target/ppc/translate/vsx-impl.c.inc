@@ -3212,17 +3212,70 @@ TRANS(XVF16GER2PN, do_ger, gen_helper_XVF16GER2PN)
 TRANS(XVF16GER2NP, do_ger, gen_helper_XVF16GER2NP)
 TRANS(XVF16GER2NN, do_ger, gen_helper_XVF16GER2NN)
 
-TRANS(XVF32GER, do_ger, gen_helper_XVF32GER)
-TRANS(XVF32GERPP, do_ger, gen_helper_XVF32GERPP)
-TRANS(XVF32GERPN, do_ger, gen_helper_XVF32GERPN)
-TRANS(XVF32GERNP, do_ger, gen_helper_XVF32GERNP)
-TRANS(XVF32GERNN, do_ger, gen_helper_XVF32GERNN)
+/*
+ * MMA floating-point rank-1 updates as host FP code: row i of the
+ * accumulator is (-)(a[i] * b (+/-) row i), with element a[i] broadcast,
+ * i.e. four vector multiply-adds for xvf32ger*, four for xvf64ger*.  Only
+ * without masks (which the prefixed forms may set).  Like the helpers, no
+ * FI or FPRF update.
+ */
+static bool do_ger_fp(DisasContext *ctx, arg_MMIRR_XX3 *a,
+    void (*helper)(TCGv_env, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_i32),
+    unsigned vece, bool acc, unsigned neg)
+{
+    bool dbl = vece == MO_64;
+    int rows_bits = 0xf, cols_bits = dbl ? 0x3 : 0xf;
+    unsigned fpop = acc ? (TCG_FPOP_FMA | TCG_FPOP_F_DEFNAN |
+                           TCG_FPOP_F_NAN_ACB | neg)
+                        : (TCG_FPOP_MUL | TCG_FPOP_F_DEFNAN);
+    TCGv_vec vb, ai, r;
 
-TRANS(XVF64GER, do_ger, gen_helper_XVF64GER)
-TRANS(XVF64GERPP, do_ger, gen_helper_XVF64GERPP)
-TRANS(XVF64GERPN, do_ger, gen_helper_XVF64GERPN)
-TRANS(XVF64GERNP, do_ger, gen_helper_XVF64GERNP)
-TRANS(XVF64GERNN, do_ger, gen_helper_XVF64GERNN)
+    REQUIRE_INSNS_FLAGS2(ctx, ISA310);
+    REQUIRE_VSX(ctx);
+    if (unlikely((a->xa / 4 == a->xt) || (a->xb / 4 == a->xt))) {
+        gen_invalid(ctx);
+        return true;
+    }
+    if ((a->xmsk & rows_bits) != rows_bits ||
+        (a->ymsk & cols_bits) != cols_bits ||
+        !vsj_ok(ctx, fpop, TCG_TYPE_V128, vece)) {
+        return do_ger(ctx, a, helper);
+    }
+
+    vb = vsj_ld(TCG_TYPE_V128, a->xb);
+    ai = tcg_temp_new_vec(TCG_TYPE_V128);
+    r = tcg_temp_new_vec(TCG_TYPE_V128);
+    for (int i = 0; i < 4; i++) {
+        /* element i of xa (float) or of the pair xa:xa+1 (double) */
+        int ofs = dbl ? vsr_full_offset(a->xa + i / 2) + 8 * (1 - i % 2)
+                      : vsr_full_offset(a->xa) + 4 * (3 - i);
+        int row = acc_full_offset(a->xt) + 16 * i;
+
+        tcg_gen_dup_mem_vec(vece, ai, tcg_env, ofs);
+        if (acc) {
+            TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+            tcg_gen_ld_vec(t, tcg_env, row);
+            tcg_gen_fpop3_vec(vece, r, ai, vb, t, fpop);
+        } else {
+            tcg_gen_fpop2_vec(vece, r, ai, vb, fpop);
+        }
+        tcg_gen_st_vec(r, tcg_env, row);
+    }
+    fpj_mark(r, FPJ_FLAGS);
+    return true;
+}
+
+TRANS(XVF32GER, do_ger_fp, gen_helper_XVF32GER, MO_32, false, 0)
+TRANS(XVF32GERPP, do_ger_fp, gen_helper_XVF32GERPP, MO_32, true, 0)
+TRANS(XVF32GERPN, do_ger_fp, gen_helper_XVF32GERPN, MO_32, true, MSUB_)
+TRANS(XVF32GERNP, do_ger_fp, gen_helper_XVF32GERNP, MO_32, true, NMSUB_)
+TRANS(XVF32GERNN, do_ger_fp, gen_helper_XVF32GERNN, MO_32, true, NMADD_)
+
+TRANS(XVF64GER, do_ger_fp, gen_helper_XVF64GER, MO_64, false, 0)
+TRANS(XVF64GERPP, do_ger_fp, gen_helper_XVF64GERPP, MO_64, true, 0)
+TRANS(XVF64GERPN, do_ger_fp, gen_helper_XVF64GERPN, MO_64, true, MSUB_)
+TRANS(XVF64GERNP, do_ger_fp, gen_helper_XVF64GERNP, MO_64, true, NMSUB_)
+TRANS(XVF64GERNN, do_ger_fp, gen_helper_XVF64GERNN, MO_64, true, NMADD_)
 
 TRANS64(PMXVBF16GER2, do_ger, gen_helper_XVBF16GER2)
 TRANS64(PMXVBF16GER2PP, do_ger, gen_helper_XVBF16GER2PP)
@@ -3236,17 +3289,17 @@ TRANS64(PMXVF16GER2PN, do_ger, gen_helper_XVF16GER2PN)
 TRANS64(PMXVF16GER2NP, do_ger, gen_helper_XVF16GER2NP)
 TRANS64(PMXVF16GER2NN, do_ger, gen_helper_XVF16GER2NN)
 
-TRANS64(PMXVF32GER, do_ger, gen_helper_XVF32GER)
-TRANS64(PMXVF32GERPP, do_ger, gen_helper_XVF32GERPP)
-TRANS64(PMXVF32GERPN, do_ger, gen_helper_XVF32GERPN)
-TRANS64(PMXVF32GERNP, do_ger, gen_helper_XVF32GERNP)
-TRANS64(PMXVF32GERNN, do_ger, gen_helper_XVF32GERNN)
+TRANS64(PMXVF32GER, do_ger_fp, gen_helper_XVF32GER, MO_32, false, 0)
+TRANS64(PMXVF32GERPP, do_ger_fp, gen_helper_XVF32GERPP, MO_32, true, 0)
+TRANS64(PMXVF32GERPN, do_ger_fp, gen_helper_XVF32GERPN, MO_32, true, MSUB_)
+TRANS64(PMXVF32GERNP, do_ger_fp, gen_helper_XVF32GERNP, MO_32, true, NMSUB_)
+TRANS64(PMXVF32GERNN, do_ger_fp, gen_helper_XVF32GERNN, MO_32, true, NMADD_)
 
-TRANS64(PMXVF64GER, do_ger, gen_helper_XVF64GER)
-TRANS64(PMXVF64GERPP, do_ger, gen_helper_XVF64GERPP)
-TRANS64(PMXVF64GERPN, do_ger, gen_helper_XVF64GERPN)
-TRANS64(PMXVF64GERNP, do_ger, gen_helper_XVF64GERNP)
-TRANS64(PMXVF64GERNN, do_ger, gen_helper_XVF64GERNN)
+TRANS64(PMXVF64GER, do_ger_fp, gen_helper_XVF64GER, MO_64, false, 0)
+TRANS64(PMXVF64GERPP, do_ger_fp, gen_helper_XVF64GERPP, MO_64, true, 0)
+TRANS64(PMXVF64GERPN, do_ger_fp, gen_helper_XVF64GERPN, MO_64, true, MSUB_)
+TRANS64(PMXVF64GERNP, do_ger_fp, gen_helper_XVF64GERNP, MO_64, true, NMSUB_)
+TRANS64(PMXVF64GERNN, do_ger_fp, gen_helper_XVF64GERNN, MO_64, true, NMADD_)
 
 #undef GEN_XX2FORM
 #undef GEN_XX3FORM
