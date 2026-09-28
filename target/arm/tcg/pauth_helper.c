@@ -503,6 +503,13 @@ static bool pauth_key_enabled(CPUARMState *env, int el, uint32_t bit)
     return (arm_sctlr(env, el) & bit) != 0;
 }
 
+/* The IMPDEF PAC alone, for the generated code of translate-a64.c */
+uint64_t HELPER(pac_hash)(uint64_t data, uint64_t modifier,
+                          uint64_t key_lo, uint64_t key_hi)
+{
+    return qemu_xxhash64_4(data, modifier, key_lo, key_hi);
+}
+
 uint64_t HELPER(pacia)(CPUARMState *env, uint64_t x, uint64_t y)
 {
     int el = arm_current_el(env);

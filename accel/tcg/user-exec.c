@@ -344,11 +344,13 @@ static bool pageflags_set_clear(vaddr start, vaddr last,
 
     /*
      * Need to flush if an overlapping executable region
-     * removes exec, adds write, or is a new mapping.
+     * removes exec, adds write, or is a new mapping; or changes a target
+     * page flag, which translators may read (Arm BTI guarded pages).
      */
     if ((p_flags & PAGE_EXEC)
         && (!(merge_flags & PAGE_EXEC)
             || (merge_flags & ~p_flags & PAGE_WRITE)
+            || ((merge_flags ^ p_flags) & (PAGE_TARGET_1 | PAGE_TARGET_2))
             || (clear_flags & PAGE_VALID))) {
         inval_tb = true;
     }

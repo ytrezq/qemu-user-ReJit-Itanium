@@ -138,6 +138,14 @@ typedef struct DisasContext {
     bool unpriv;
     /* True if v8.3-PAuth is active.  */
     bool pauth_active;
+    /*
+     * User mode, PAuth with the IMPDEF algorithm: bottom bit of the PAC
+     * field of instruction [0] and data [1] pointers whose bit 55 is clear,
+     * and the keys enabled in SCTLR (bit n for IA, IB, DA, DB), both fixed
+     * after reset in user mode; pac_bot 0: PAC instructions use helpers.
+     */
+    uint8_t pac_bot[2];
+    uint8_t pac_keys;
     /* True if v8.5-MTE access to tags is enabled; index with is_unpriv.  */
     bool ata[2];
     /* True if v8.5-MTE tag checks affect the PE; index with is_unpriv.  */

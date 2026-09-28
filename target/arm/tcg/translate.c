@@ -1311,6 +1311,41 @@ static void gen_goto_ptr(void)
     tcg_gen_lookup_and_goto_ptr();
 }
 
+/*
+ * End of a TB with an indirect branch (DISAS_JUMP): the branch changed
+ * the pc and maybe the Thumb state, and left the IT state in env; the
+ * rest of the TB flags is that of this TB (VMSR, SETEND, CPS... end the
+ * TB differently), so the jump cache can be probed in generated code.
+ * See arm_get_tb_cpu_state().
+ */
+static void gen_goto_ptr_cached(DisasContext *s)
+{
+    uint64_t cs_base = s->base.tb->cs_base;
+    TCGv_i64 cs, t, pc;
+
+    if (arm_dc_feature(s, ARM_FEATURE_M)) {
+        /* more state computed at lookup time */
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+    cs_base = FIELD_DP32(cs_base, TBFLAG_AM32, THUMB, 0);
+    cs_base = FIELD_DP32(cs_base, TBFLAG_AM32, CONDEXEC, 0);
+    cs = tcg_temp_new_i64();
+    t = tcg_temp_new_i64();
+    QEMU_BUILD_BUG_ON(sizeof_field(CPUARMState, thumb) != 1);
+    tcg_gen_ld8u_i64(cs, tcg_env, offsetof(CPUARMState, thumb));
+    tcg_gen_shli_i64(cs, cs, R_TBFLAG_AM32_THUMB_SHIFT);
+    tcg_gen_ld32u_i64(t, tcg_env, offsetof(CPUARMState, condexec_bits));
+    tcg_gen_shli_i64(t, t, R_TBFLAG_AM32_CONDEXEC_SHIFT);
+    tcg_gen_or_i64(cs, cs, t);
+    tcg_gen_ori_i64(cs, cs, cs_base);
+    pc = tcg_temp_new_i64();
+    tcg_gen_extu_i32_i64(pc, cpu_R[15]);
+    tcg_gen_lookup_and_goto_ptr_cached_tb(pc,
+                                          tcg_constant_i32(s->base.tb->flags),
+                                          cs);
+}
+
 /* This will end the TB but doesn't guarantee we'll return to
  * cpu_loop_exec. Any live exit_requests will be processed as we
  * enter the next TB.
@@ -6848,9 +6883,10 @@ static void arm_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
             break;
         case DISAS_UPDATE_NOCHAIN:
             gen_update_pc(dc, curr_insn_len(dc));
-            /* fall through */
-        case DISAS_JUMP:
             gen_goto_ptr();
+            break;
+        case DISAS_JUMP:
+            gen_goto_ptr_cached(dc);
             break;
         case DISAS_UPDATE_EXIT:
             gen_update_pc(dc, curr_insn_len(dc));
