@@ -191,12 +191,106 @@ static bool require_noover(const int8_t dst, const int8_t dst_lmul,
     return !is_overlapped(dst, dst_size, src, src_size);
 }
 
+/*
+ * vsetvli and vsetivli with a vtype valid for this CPU (known at
+ * translation time): vl computed in generated code instead of by
+ * helper_vsetvl(), and the TB chained to the next one with goto_tb
+ * instead of looked up, which a vector loop does at each iteration.
+ * This is sound because the flags of the next TB are a function of the
+ * flags of this TB, of vtype, and of vl == VLMAX: one exit for each of
+ * the two cases (see riscv_get_tb_cpu_state; not with Zicfilp, whose
+ * ELP an lpad of this TB may have cleared).
+ * @avl: the AVL, or NULL for rs1 = x0 (VLMAX if rd != x0, else vl).
+ * Returns false if not applicable, for the general path.
+ */
+static bool do_vsetvl_imm(DisasContext *s, int rd, int rs1, TCGv avl,
+                          target_ulong vtype)
+{
+    const RISCVCPUConfig *cfg = s->cfg_ptr;
+    uint32_t vlmul = FIELD_EX64(vtype, VTYPE, VLMUL);
+    uint32_t vsew = FIELD_EX64(vtype, VTYPE, VSEW);
+    uint32_t sew = 8 << vsew;
+    bool altfmt = FIELD_EX64(vtype, VTYPE, ALTFMT);
+    int rsv = cfg->ext_zvfbfa ? R_VTYPE_RESERVED_SHIFT : R_VTYPE_ALTFMT_SHIFT;
+    uint32_t vlmax, maxsz;
+    bool vl_const = false;
+    TCGv_i32 vl;
+    TCGv dst;
+
+    if (s->fcfi_enabled || get_xl(s) != MXL_RV64 || cfg->rvv_vl_half_avl
+        || (rd == 0 && rs1 == 0 && cfg->rvv_vsetvl_x0_vill)
+        || !translator_use_goto_tb(&s->base, s->base.pc_next)) {
+        return false;
+    }
+    /* the checks of helper_vsetvl() */
+    if ((vlmul & 4) && (vlmul == 4 || (cfg->elen >> (8 - vlmul)) < sew)) {
+        return false;
+    }
+    if (altfmt && !(cfg->ext_zvfbfa && (vsew == MO_8 || vsew == MO_16))) {
+        return false;
+    }
+    if (sew > cfg->elen || (vtype & MAKE_64BIT_MASK(rsv, 63 - rsv))) {
+        return false;
+    }
+
+    vlmax = vext_get_vlmax(cfg->vlenb, vsew, sextract32(vlmul, 0, 3));
+    maxsz = vlmax << vsew;
+    vl = tcg_temp_new_i32();
+    if (avl == NULL && rd != 0) {
+        tcg_gen_movi_i32(vl, vlmax);
+        vl_const = true;
+    } else if (avl == NULL) {
+        /* vl = min(vl, VLMAX) */
+        tcg_gen_umin_i32(vl, cpu_vl, tcg_constant_i32(vlmax));
+    } else if (tcgv_tl_temp(avl)->kind == TEMP_CONST) {
+        target_ulong a = tcgv_tl_temp(avl)->val;
+
+        tcg_gen_movi_i32(vl, MIN(a, vlmax));
+        vl_const = true;
+    } else {
+        TCGv t = tcg_temp_new();
+
+        tcg_gen_umin_tl(t, avl, tcg_constant_tl(vlmax));
+        tcg_gen_trunc_tl_i32(vl, t);
+    }
+    tcg_gen_mov_i32(cpu_vl, vl);
+    tcg_gen_st_i64(tcg_constant_i64(vtype), tcg_env,
+                   offsetof(CPURISCVState, vtype));
+    tcg_gen_movi_i32(cpu_vstart, 0);
+    QEMU_BUILD_BUG_ON(sizeof_field(CPURISCVState, vill) != 1);
+    tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                    offsetof(CPURISCVState, vill));
+    dst = dest_gpr(s, rd);
+    tcg_gen_extu_i32_tl(dst, vl);
+    gen_set_gpr(s, rd, dst);
+    finalize_rvv_inst(s);
+
+    if (vl_const || maxsz < 8) {
+        gen_goto_tb(s, 0, s->cur_insn_len);
+    } else {
+        TCGLabel *eq = gen_new_label();
+
+        tcg_gen_brcondi_i32(TCG_COND_EQ, vl, vlmax, eq);
+        gen_goto_tb(s, 0, s->cur_insn_len);
+        gen_set_label(eq);
+        gen_goto_tb(s, 1, s->cur_insn_len);
+    }
+    s->base.is_jmp = DISAS_NORETURN;
+    return true;
+}
+
 static bool do_vsetvl(DisasContext *s, int rd, int rs1, TCGv s2)
 {
     TCGv s1, dst;
 
     if (!require_rvv(s) || !s->cfg_ptr->ext_zve32x) {
         return false;
+    }
+    if (tcgv_tl_temp(s2)->kind == TEMP_CONST
+        && do_vsetvl_imm(s, rd, rs1,
+                         rs1 == 0 ? NULL : get_gpr(s, rs1, EXT_ZERO),
+                         tcgv_tl_temp(s2)->val)) {
+        return true;
     }
 
     dst = dest_gpr(s, rd);
@@ -227,6 +321,10 @@ static bool do_vsetivli(DisasContext *s, int rd, TCGv s1, TCGv s2)
 
     if (!require_rvv(s) || !s->cfg_ptr->ext_zve32x) {
         return false;
+    }
+    /* the AVL of vsetivli is an immediate: never NULL (x0) */
+    if (do_vsetvl_imm(s, rd, -1, s1, tcgv_tl_temp(s2)->val)) {
+        return true;
     }
 
     dst = dest_gpr(s, rd);
@@ -731,7 +829,7 @@ static bool ldst_us_trans(uint32_t vd, uint32_t rs1, uint32_t data,
      * around the loop.
      */
     if (is_store && s->ztso) {
-        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+        tcg_gen_mb(TCG_MO_LD_ST | TCG_MO_ST_ST | TCG_BAR_STRL);
     }
 
     mark_vs_dirty(s);
@@ -739,7 +837,7 @@ static bool ldst_us_trans(uint32_t vd, uint32_t rs1, uint32_t data,
     fn(dest, mask, base, tcg_env, desc);
 
     if (!is_store && s->ztso) {
-        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_LDAQ);
     }
 
     finalize_rvv_inst(s);

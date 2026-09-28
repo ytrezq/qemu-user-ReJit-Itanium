@@ -290,6 +290,29 @@ static void lookup_and_goto_ptr(DisasContext *ctx)
     tcg_gen_lookup_and_goto_ptr();
 }
 
+/*
+ * lookup_and_goto_ptr() with the jump cache probed in generated code
+ * (user mode, RV64), for a next TB whose flags are @flags and whose
+ * cs_base is that of this TB.  Instructions inside a TB change none of
+ * the state in the TB flags, except that vstart returns to zero, which
+ * can only leave VSTART_EQ_ZERO and VL_EQ_VLMAX conservative (the next TB
+ * is then just less optimized), and that Zicfilp sets ELP: not with it.
+ */
+static void lookup_and_goto_ptr_cached(DisasContext *ctx, TCGv_i32 flags)
+{
+#ifdef CONFIG_USER_ONLY
+    if (!ctx->fcfi_enabled && get_xl(ctx) == MXL_RV64) {
+        TCGv_i64 pc = tcg_temp_new_i64();
+
+        tcg_gen_extu_tl_i64(pc, cpu_pc);
+        tcg_gen_lookup_and_goto_ptr_cached_tb(pc, flags,
+                                  tcg_constant_i64(ctx->base.tb->cs_base));
+        return;
+    }
+#endif
+    lookup_and_goto_ptr(ctx);
+}
+
 static void exit_tb(DisasContext *ctx)
 {
 #ifndef CONFIG_USER_ONLY

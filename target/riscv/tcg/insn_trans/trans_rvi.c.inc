@@ -183,7 +183,8 @@ static bool trans_jalr(DisasContext *ctx, arg_jalr *a)
         }
     }
 
-    lookup_and_goto_ptr(ctx);
+    /* same TB flags (jalr only sets ELP, see lookup_and_goto_ptr_cached) */
+    lookup_and_goto_ptr_cached(ctx, tcg_constant_i32(ctx->base.tb->flags));
 
     if (misaligned) {
         gen_set_label(misaligned);
@@ -420,8 +421,14 @@ static bool gen_load(DisasContext *ctx, arg_lb *a, MemOp memop)
         out = gen_load_tl(ctx, a, memop);
     }
 
+    /*
+     * RVTSO: a load is ordered before the later loads and stores
+     * (acquire-RCpc), which a TSO host such as x86 already does: no fence.
+     * TCG_MO_ALL would also order earlier stores before it, the one thing
+     * TSO does not, and cost a locked instruction per load.
+     */
     if (ctx->ztso) {
-        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_LDAQ);
     }
 
     return out;
@@ -481,8 +488,9 @@ static bool gen_store_tl(DisasContext *ctx, arg_sb *a, MemOp memop)
     TCGv addr = get_address(ctx, a->rs1, a->imm);
     TCGv data = get_gpr(ctx, a->rs2, EXT_NONE);
 
+    /* RVTSO: earlier loads and stores before this one (release-RCpc) */
     if (ctx->ztso) {
-        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+        tcg_gen_mb(TCG_MO_LD_ST | TCG_MO_ST_ST | TCG_BAR_STRL);
     }
 
     tcg_gen_qemu_st_tl(data, addr, ctx->mem_idx, memop);

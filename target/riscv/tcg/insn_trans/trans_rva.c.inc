@@ -47,8 +47,11 @@ static bool gen_lr(DisasContext *ctx, arg_atomic *a, MemOp mop)
      * TSO defines AMOs as acquire+release-RCsc, but does not define LR/SC as
      * AMOs.  Instead treat them like loads.
      */
-    if (a->aq || ctx->ztso) {
+    if (a->aq) {
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+    } else if (ctx->ztso) {
+        /* as for gen_load() */
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_LDAQ);
     }
 
     /* Put addr in load_res, data in load_val.  */
