@@ -3164,6 +3164,11 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_st_vec:
             done = fold_tcg_st_memcopy(&ctx, op);
             break;
+        case INDEX_op_stm_vec:
+            /* a store through a pointer, which may point into env */
+            remove_mem_copy_all(&ctx);
+            done = finish_folding(&ctx, op);
+            break;
         case INDEX_op_mb:
             done = fold_mb(&ctx, op);
             break;

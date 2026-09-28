@@ -184,6 +184,8 @@ DEF(fpop2_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(fpop3_vec, 1, 3, 1, TCG_OPF_VECTOR)
 /* i32 output with a TCG_FPCC_* bit: compare of the scalar elements. */
 DEF(fpcmpcc_vec, 1, 2, 1, TCG_OPF_VECTOR)
+/* i32 = 1 if any bit of the vector is set, else 0 (fpop backends) */
+DEF(anytrue_vec, 1, 1, 0, TCG_OPF_VECTOR)
 /* the same on i64 temps (TCG_TYPE_V64 scalars), see tcg-fpop.h */
 DEF(fpop1_i64, 1, 1, 1, TCG_OPF_VECTOR)
 DEF(fpop2_i64, 1, 2, 1, TCG_OPF_VECTOR)

@@ -2477,6 +2477,157 @@ GEN_OPIVX_WIDEN_TRANS(vwmaccsu_vx, opivx_overwrite_widen_check)
 GEN_OPIVX_WIDEN_TRANS(vwmaccus_vx, opivx_overwrite_widen_check)
 
 /* Vector Integer Merge and Move Instructions */
+#ifdef CONFIG_USER_ONLY
+/*
+ * Inline results for vl < VLMAX too (user mode, VLEN 128 or 256, vstart
+ * 0, tail undisturbed): vreg_st_vl() writes the elements of register r of
+ * the group below vl and, for vm = 0, whose v0 bit is set (mask
+ * undisturbed), with a masked store into env when that is not the whole
+ * register.  EEW = SEW, EMUL = LMUL.
+ */
+static bool vreg_vl_ok(DisasContext *s, bool vm)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+
+    return (vlenb == 16 || vlenb == 32) && s->vstart_eq_zero && !s->vta
+           && (vm || !s->vma)
+           && tcg_can_emit_ldstm(vlenb == 32 ? TCG_TYPE_V256 : TCG_TYPE_V128);
+}
+
+static int vreg_vl_nregs(DisasContext *s)
+{
+    return s->lmul > 0 ? 1 << s->lmul : 1;
+}
+
+static void vreg_st_vl(DisasContext *s, uint32_t vd, int r, TCGv_vec v,
+                       bool vm)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+    unsigned sew = s->sew;
+    uint32_t n = vlenb >> sew;
+    uint32_t vlmax = s->lmul < 0 ? n >> -s->lmul : n << s->lmul;
+    uint32_t ofs = vreg_ofs(s, vd + r);
+    TCGv_i64 mask = NULL;
+    TCGv_ptr p;
+
+    if (s->vl_const >= 0) {
+        uint32_t vlc = s->vl_const;
+        uint32_t cnt = MIN((r + 1) * n, vlc) - MIN(r * n, vlc);
+
+        if (cnt == 0) {
+            return;
+        }
+        if (cnt < n) {
+            mask = tcg_constant_i64(MAKE_64BIT_MASK(0, cnt));
+        }
+    } else {
+        TCGv_i32 hi = tcg_temp_new_i32();
+        TCGv_i32 lo = tcg_temp_new_i32();
+
+        /* min(vl, (r + 1) * n) - min(vl, r * n) */
+        tcg_gen_umin_i32(hi, cpu_vl,
+                         tcg_constant_i32(MIN((r + 1) * n, vlmax)));
+        tcg_gen_umin_i32(lo, cpu_vl, tcg_constant_i32(r * n));
+        tcg_gen_sub_i32(hi, hi, lo);
+        mask = tcg_temp_new_i64();
+        tcg_gen_extu_i32_i64(mask, hi);
+        tcg_gen_shl_i64(mask, tcg_constant_i64(1), mask);
+        tcg_gen_subi_i64(mask, mask, 1);
+    }
+    if (!vm) {
+        uint32_t bit = r * n;
+        TCGv_i64 m0 = tcg_temp_new_i64();
+
+        tcg_gen_ld_i64(m0, tcg_env, vreg_ofs(s, 0) + bit / 64 * 8);
+        tcg_gen_shri_i64(m0, m0, bit % 64);
+        if (mask) {
+            tcg_gen_and_i64(m0, m0, mask);
+        }
+        mask = m0;
+    }
+    if (!mask) {
+        tcg_gen_st_vec(v, tcg_env, ofs);
+        return;
+    }
+    p = tcg_temp_new_ptr();
+    tcg_gen_addi_ptr(p, tcg_env, ofs);
+    tcg_gen_stm_elem_vec(sew, v, p, mask);
+}
+
+static TCGType vreg_type(DisasContext *s)
+{
+    return s->cfg_ptr->vlenb == 32 ? TCG_TYPE_V256 : TCG_TYPE_V128;
+}
+
+/* vmv.v.x, vmv.v.i when vl may be less than VLMAX */
+static bool vmv_vx_inline(DisasContext *s, uint32_t vd, TCGv_i64 x)
+{
+    TCGv_vec v;
+
+    if (!vreg_vl_ok(s, true)) {
+        return false;
+    }
+    v = tcg_temp_new_vec(vreg_type(s));
+    tcg_gen_dup_i64_vec(s->sew, v, x);
+    for (int r = 0; r < vreg_vl_nregs(s); r++) {
+        vreg_st_vl(s, vd, r, v, true);
+    }
+    mark_vs_dirty(s);
+    return true;
+}
+
+/* 0, 1, 2... for vid.v: 256 bytes of elements of each size */
+static uint8_t vid_table[4][256] QEMU_ALIGNED(32);
+
+static void vid_table_init(void)
+{
+    for (int i = 0; i < 256; i++) {
+        vid_table[MO_8][i] = i;
+    }
+    for (int i = 0; i < 128; i++) {
+        ((uint16_t *)vid_table[MO_16])[i] = cpu_to_le16(i);
+    }
+    for (int i = 0; i < 64; i++) {
+        ((uint32_t *)vid_table[MO_32])[i] = cpu_to_le32(i);
+    }
+    for (int i = 0; i < 32; i++) {
+        ((uint64_t *)vid_table[MO_64])[i] = cpu_to_le64(i);
+    }
+}
+
+static bool vid_inline(DisasContext *s, uint32_t vd, bool vm)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+    int nregs = vreg_vl_nregs(s);
+
+    if (!vreg_vl_ok(s, vm) || nregs * vlenb > 256) {
+        return false;
+    }
+    for (int r = 0; r < nregs; r++) {
+        TCGv_vec v = tcg_temp_new_vec(vreg_type(s));
+
+        tcg_gen_ld_vec(v, tcg_constant_ptr(vid_table[s->sew] + r * vlenb), 0);
+        vreg_st_vl(s, vd, r, v, vm);
+    }
+    mark_vs_dirty(s);
+    return true;
+}
+#else
+static bool vmv_vx_inline(DisasContext *s, uint32_t vd, TCGv_i64 x)
+{
+    return false;
+}
+
+static bool vid_inline(DisasContext *s, uint32_t vd, bool vm)
+{
+    return false;
+}
+
+static void vid_table_init(void)
+{
+}
+#endif
+
 static bool trans_vmv_v_v(DisasContext *s, arg_vmv_v_v *a)
 {
     if (require_rvv(s) &&
@@ -2539,6 +2690,10 @@ static bool trans_vmv_v_x(DisasContext *s, arg_vmv_v_x *a)
             };
 
             tcg_gen_ext_tl_i64(s1_i64, s1);
+            if (vmv_vx_inline(s, a->rd, s1_i64)) {
+                finalize_rvv_inst(s);
+                return true;
+            }
             desc = tcg_constant_i32(simd_desc(s->cfg_ptr->vlenb,
                                               s->cfg_ptr->vlenb, data));
             tcg_gen_addi_ptr(dest, tcg_env, vreg_ofs(s, a->rd));
@@ -2573,6 +2728,10 @@ static bool trans_vmv_v_i(DisasContext *s, arg_vmv_v_i *a)
             };
 
             s1 = tcg_constant_i64(simm);
+            if (vmv_vx_inline(s, a->rd, s1)) {
+                finalize_rvv_inst(s);
+                return true;
+            }
             dest = tcg_temp_new_ptr();
             desc = tcg_constant_i32(simd_desc(s->cfg_ptr->vlenb,
                                               s->cfg_ptr->vlenb, data));
@@ -2594,16 +2753,167 @@ GEN_OPIVI_TRANS(vmerge_vim, IMM_SX, vmerge_vxm, opivx_vadc_check)
  */
 
 /* Vector Single-Width Saturating Add and Subtract */
-GEN_OPIVV_TRANS(vsaddu_vv, opivv_check)
-GEN_OPIVV_TRANS(vsadd_vv,  opivv_check)
-GEN_OPIVV_TRANS(vssubu_vv, opivv_check)
-GEN_OPIVV_TRANS(vssub_vv,  opivv_check)
-GEN_OPIVX_TRANS(vsaddu_vx,  opivx_check)
-GEN_OPIVX_TRANS(vsadd_vx,  opivx_check)
-GEN_OPIVX_TRANS(vssubu_vx,  opivx_check)
-GEN_OPIVX_TRANS(vssub_vx,  opivx_check)
-GEN_OPIVI_TRANS(vsaddu_vi, IMM_SX, vsaddu_vx, opivx_check)
-GEN_OPIVI_TRANS(vsadd_vi, IMM_SX, vsadd_vx, opivx_check)
+typedef enum { SAT_ADDU, SAT_ADD, SAT_SUBU, SAT_SUB } SatOp;
+
+/*
+ * Whole register groups (vl == VLMAX, LMUL >= 1, unmasked), vs1 or the
+ * scalar @src: the saturating host operation (unsigned 32 and 64 bits:
+ * umin/umax, then the wrapping one), and vxsat set if any element
+ * saturated, i.e. differs from the wrapping result.  Not for vxsat alone,
+ * the helpers go element by element with an indirect call each.
+ */
+static bool sat_inline(DisasContext *s, arg_rmrr *a, SatOp op, TCGv_i64 src)
+{
+    uint32_t vlenb = s->cfg_ptr->vlenb;
+    TCGType type = vlenb == 32 ? TCG_TYPE_V256 : TCG_TYPE_V128;
+    unsigned vece = s->sew;
+    bool u = op == SAT_ADDU || op == SAT_SUBU;
+    bool native = vece <= MO_16;
+    TCGv_vec acc = NULL, sc = NULL;
+    TCGv_i32 any;
+    TCGv t, vx;
+    int r;
+
+    if (!s->vl_eq_vlmax || !a->vm || s->lmul < 0
+        || (vlenb != 16 && vlenb != 32)
+        || !tcg_op_supported(INDEX_op_anytrue_vec, type, 0)
+        || !(native ? tcg_can_emit_vec_op(INDEX_op_usadd_vec, type, vece) > 0
+                    : u && tcg_can_emit_vec_op(INDEX_op_umin_vec, type,
+                                               vece) > 0)) {
+        return false;
+    }
+
+    if (src) {
+        sc = tcg_temp_new_vec(type);
+        tcg_gen_dup_i64_vec(vece, sc, src);
+    }
+    for (r = 0; r < (1 << s->lmul); r++) {
+        TCGv_vec x = tcg_temp_new_vec(type);
+        TCGv_vec y = sc;
+        TCGv_vec sat = tcg_temp_new_vec(type);
+        TCGv_vec wrap = tcg_temp_new_vec(type);
+
+        tcg_gen_ld_vec(x, tcg_env, vreg_ofs(s, a->rs2 + r));
+        if (!y) {
+            y = tcg_temp_new_vec(type);
+            tcg_gen_ld_vec(y, tcg_env, vreg_ofs(s, a->rs1 + r));
+        }
+        switch (op) {
+        case SAT_ADDU:
+            if (native) {
+                tcg_gen_usadd_vec(vece, sat, x, y);
+            } else {
+                /* min(x, ~y) + y */
+                tcg_gen_not_vec(vece, sat, y);
+                tcg_gen_umin_vec(vece, sat, sat, x);
+                tcg_gen_add_vec(vece, sat, sat, y);
+            }
+            tcg_gen_add_vec(vece, wrap, x, y);
+            break;
+        case SAT_SUBU:
+            if (native) {
+                tcg_gen_ussub_vec(vece, sat, x, y);
+            } else {
+                /* max(x, y) - y */
+                tcg_gen_umax_vec(vece, sat, x, y);
+                tcg_gen_sub_vec(vece, sat, sat, y);
+            }
+            tcg_gen_sub_vec(vece, wrap, x, y);
+            break;
+        case SAT_ADD:
+            tcg_gen_ssadd_vec(vece, sat, x, y);
+            tcg_gen_add_vec(vece, wrap, x, y);
+            break;
+        case SAT_SUB:
+            tcg_gen_sssub_vec(vece, sat, x, y);
+            tcg_gen_sub_vec(vece, wrap, x, y);
+            break;
+        }
+        tcg_gen_st_vec(sat, tcg_env, vreg_ofs(s, a->rd + r));
+        tcg_gen_xor_vec(vece, wrap, wrap, sat);
+        if (acc) {
+            tcg_gen_or_vec(vece, acc, acc, wrap);
+        } else {
+            acc = wrap;
+        }
+    }
+
+    any = tcg_temp_new_i32();
+    t = tcg_temp_new();
+    vx = tcg_temp_new();
+    tcg_gen_anytrue_vec(any, acc);
+    tcg_gen_extu_i32_tl(t, any);
+    tcg_gen_ld_tl(vx, tcg_env, offsetof(CPURISCVState, vxsat));
+    tcg_gen_or_tl(vx, vx, t);
+    tcg_gen_st_tl(vx, tcg_env, offsetof(CPURISCVState, vxsat));
+    mark_vs_dirty(s);
+    finalize_rvv_inst(s);
+    return true;
+}
+
+#define GEN_OPIVV_SAT_TRANS(NAME, OP)                                    \
+static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
+{                                                                        \
+    if (opivv_check(s, a)) {                                             \
+        static gen_helper_gvec_4_ptr * const fns[4] = {                  \
+            gen_helper_##NAME##_b, gen_helper_##NAME##_h,                \
+            gen_helper_##NAME##_w, gen_helper_##NAME##_d,                \
+        };                                                               \
+        if (sat_inline(s, a, OP, NULL)) {                                \
+            return true;                                                 \
+        }                                                                \
+        return opivv_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s);\
+    }                                                                    \
+    return false;                                                        \
+}
+
+#define GEN_OPIVX_SAT_TRANS(NAME, OP)                                    \
+static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
+{                                                                        \
+    if (opivx_check(s, a)) {                                             \
+        static gen_helper_opivx * const fns[4] = {                       \
+            gen_helper_##NAME##_b, gen_helper_##NAME##_h,                \
+            gen_helper_##NAME##_w, gen_helper_##NAME##_d,                \
+        };                                                               \
+        TCGv_i64 x = tcg_temp_new_i64();                                 \
+                                                                         \
+        tcg_gen_ext_tl_i64(x, get_gpr(s, a->rs1, EXT_SIGN));             \
+        if (sat_inline(s, a, OP, x)) {                                   \
+            return true;                                                 \
+        }                                                                \
+        return opivx_trans(a->rd, a->rs1, a->rs2, a->vm, fns[s->sew], s);\
+    }                                                                    \
+    return false;                                                        \
+}
+
+#define GEN_OPIVI_SAT_TRANS(NAME, OPIVX, OP)                             \
+static bool trans_##NAME(DisasContext *s, arg_rmrr *a)                   \
+{                                                                        \
+    if (opivx_check(s, a)) {                                             \
+        static gen_helper_opivx * const fns[4] = {                       \
+            gen_helper_##OPIVX##_b, gen_helper_##OPIVX##_h,              \
+            gen_helper_##OPIVX##_w, gen_helper_##OPIVX##_d,              \
+        };                                                               \
+        if (sat_inline(s, a, OP,                                         \
+                       tcg_constant_i64(extract_imm(s, a->rs1, IMM_SX)))) { \
+            return true;                                                 \
+        }                                                                \
+        return opivi_trans(a->rd, a->rs1, a->rs2, a->vm,                 \
+                           fns[s->sew], s, IMM_SX);                      \
+    }                                                                    \
+    return false;                                                        \
+}
+
+GEN_OPIVV_SAT_TRANS(vsaddu_vv, SAT_ADDU)
+GEN_OPIVV_SAT_TRANS(vsadd_vv, SAT_ADD)
+GEN_OPIVV_SAT_TRANS(vssubu_vv, SAT_SUBU)
+GEN_OPIVV_SAT_TRANS(vssub_vv, SAT_SUB)
+GEN_OPIVX_SAT_TRANS(vsaddu_vx, SAT_ADDU)
+GEN_OPIVX_SAT_TRANS(vsadd_vx, SAT_ADD)
+GEN_OPIVX_SAT_TRANS(vssubu_vx, SAT_SUBU)
+GEN_OPIVX_SAT_TRANS(vssub_vx, SAT_SUB)
+GEN_OPIVI_SAT_TRANS(vsaddu_vi, vsaddu_vx, SAT_ADDU)
+GEN_OPIVI_SAT_TRANS(vsadd_vi, vsadd_vx, SAT_ADD)
 
 /* Vector Single-Width Averaging Add and Subtract */
 GEN_OPIVV_TRANS(vaadd_vv, opivv_check)
@@ -3836,6 +4146,10 @@ static bool trans_vid_v(DisasContext *s, arg_vid_v *a)
         require_vm(a->vm, a->rd)) {
         uint32_t data = 0;
 
+        if (vid_inline(s, a->rd, a->vm)) {
+            finalize_rvv_inst(s);
+            return true;
+        }
         data = FIELD_DP32(data, VDATA, VM, a->vm);
         data = FIELD_DP32(data, VDATA, LMUL, s->lmul);
         data = FIELD_DP32(data, VDATA, VTA, s->vta);

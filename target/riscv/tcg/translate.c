@@ -1570,6 +1570,8 @@ void riscv_translate_init(void)
 {
     int i;
 
+    vid_table_init();
+
     /*
      * cpu_gpr[0] is a placeholder for the zero register. Do not use it.
      * Use the gen_set_gpr and get_gpr helper functions when accessing regs,

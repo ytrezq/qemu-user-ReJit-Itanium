@@ -1542,6 +1542,14 @@ static bool tcg_out_fpop_vec(TCGContext *s, TCGOpcode opc, TCGType type,
     case INDEX_op_fpop3_i64:
         tcg_out_fpop_i64(s, opc, vece, args);
         return true;
+    case INDEX_op_anytrue_vec:
+        /* xor d, d; vptest a, a; setnz d */
+        tgen_arithr(s, ARITH_XOR, args[0], args[0]);
+        tcg_out_vex_modrm(s, 0x17 | P_EXT38 | P_DATA16
+                          | (type == TCG_TYPE_V256 ? P_VEXL : 0),
+                          args[1], 0, args[1]);
+        tcg_out_modrm(s, OPC_SETCC | JCC_JNE, 0, args[0]);
+        return true;
     case INDEX_op_ldm_vec:
     case INDEX_op_ldmm_vec:
         {

@@ -523,6 +523,7 @@ void tcg_gen_fpop3_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
                        TCGv_vec c, unsigned fpop);
 void tcg_gen_fpcmpcc_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
                          unsigned fpop);
+void tcg_gen_anytrue_vec(TCGv_i32 r, TCGv_vec a);
 void tcg_gen_fpop1_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, unsigned fpop);
 void tcg_gen_fpop2_i64(unsigned vece, TCGv_i64 r, TCGv_i64 a, TCGv_i64 b,
                        unsigned fpop);
