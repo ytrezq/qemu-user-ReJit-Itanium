@@ -15,10 +15,15 @@
 #define TB_JMP_CACHE_BITS 14
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 /*
- * User mode: low pc bits that do not help the hash (instructions are at
- * least 4-byte aligned on many targets).
+ * User mode hash: with x = pc >> 1, x ^ (x >> 1) maps the low bits of x
+ * one to one onto the table index, both for 2-byte aligned instructions
+ * (Thumb, s390x) and 4-byte aligned ones (where it is y ^ (y << 1) of
+ * y = pc >> 2): the alignment bits are never wasted.  The higher bits
+ * are folded in with one more shift.
  */
-#define TB_JMP_CACHE_PC_SHIFT 2
+#define TB_JMP_CACHE_HASH_S1   1
+#define TB_JMP_CACHE_HASH_S2   2
+#define TB_JMP_CACHE_HASH_S3   (TB_JMP_CACHE_BITS + 2)
 
 /*
  * Invalidated in parallel; all accesses to 'tb' must be atomic.

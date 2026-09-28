@@ -115,8 +115,21 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
         return false;
     }
 
+#ifdef CONFIG_USER_ONLY
+    /*
+     * The destination TB is looked up by its virtual address, which is
+     * all there is in user mode, and page_set_flags() invalidates the
+     * TBs of a page that is unmapped, loses PROT_EXEC or gains
+     * PROT_WRITE, which also unlinks the jumps into them.  A direct jump
+     * to another page is therefore as safe as one within the page, and
+     * calls to functions in other pages no longer go through the TB
+     * lookup at every execution.
+     */
+    return true;
+#else
     /* Check for the dest on the same page as the start of the TB.  */
     return translator_is_same_page(db, dest);
+#endif
 }
 
 void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,

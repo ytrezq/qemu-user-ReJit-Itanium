@@ -2646,7 +2646,8 @@ void tcg_gen_lookup_and_goto_ptr(void)
     tcg_temp_free_ptr(ptr);
 }
 
-void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs)
+void tcg_gen_lookup_and_goto_ptr_cached_tb(TCGv_i64 pc, TCGv_i32 flags,
+                                           TCGv_i64 cs_base)
 {
 #ifdef CONFIG_USER_ONLY
     /*
@@ -2682,8 +2683,10 @@ void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs)
     p = tcg_temp_ebb_new_ptr();
 
     /* entry = &jc->array[tb_jmp_cache_hash_func(pc)], user-mode version */
-    tcg_gen_shri_i64(h, pc, TB_JMP_CACHE_BITS + TB_JMP_CACHE_PC_SHIFT);
-    tcg_gen_shri_i64(t, pc, TB_JMP_CACHE_PC_SHIFT);
+    tcg_gen_shri_i64(h, pc, TB_JMP_CACHE_HASH_S1);
+    tcg_gen_shri_i64(t, pc, TB_JMP_CACHE_HASH_S2);
+    tcg_gen_xor_i64(h, h, t);
+    tcg_gen_shri_i64(t, pc, TB_JMP_CACHE_HASH_S3);
     tcg_gen_xor_i64(h, h, t);
     tcg_gen_andi_i64(h, h, TB_JMP_CACHE_SIZE - 1);
     tcg_gen_shli_i64(h, h, 4);
@@ -2697,10 +2700,11 @@ void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs)
     tcg_gen_ld_i64(t, ent, offsetof(CPUJumpCache, array[0].pc));
     tcg_gen_brcond_i64(TCG_COND_NE, t, pc, miss);
 
-    /* tb->flags == current flags */
+    /* tb->flags and tb->cs_base == those of the current cpu state */
     tcg_gen_ld_i32(a, tb, offsetof(TranslationBlock, flags));
-    tcg_gen_ld_i32(b, tcg_env, flags_ofs);
-    tcg_gen_brcond_i32(TCG_COND_NE, a, b, miss);
+    tcg_gen_brcond_i32(TCG_COND_NE, a, flags, miss);
+    tcg_gen_ld_i64(t, tb, offsetof(TranslationBlock, cs_base));
+    tcg_gen_brcond_i64(TCG_COND_NE, t, cs_base, miss);
 
     /*
      * tb->cflags == curr_cflags(): outside of debugging modes (which make
@@ -2730,4 +2734,13 @@ void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs)
     gen_set_label(miss);
 #endif
     tcg_gen_lookup_and_goto_ptr();
+}
+
+void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs)
+{
+    TCGv_i32 flags = tcg_temp_ebb_new_i32();
+
+    tcg_gen_ld_i32(flags, tcg_env, flags_ofs);
+    tcg_gen_lookup_and_goto_ptr_cached_tb(pc, flags, tcg_constant_i64(0));
+    tcg_temp_free_i32(flags);
 }
