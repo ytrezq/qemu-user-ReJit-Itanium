@@ -432,6 +432,9 @@ struct TCGContext {
     /* Tells which temporary holds a given register.
        It does not take into account fixed registers */
     TCGTemp *reg_to_temp[TCG_TARGET_NB_REGS];
+    /* The TEMP_TB temps, for the register allocator at basic block ends */
+    TCGTemp **reg_tb_temps;
+    int nb_reg_tb_temps;
 
     uint16_t gen_insn_end_off[TCG_MAX_INSNS];
     uint64_t *gen_insn_data;

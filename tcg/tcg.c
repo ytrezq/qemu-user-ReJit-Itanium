@@ -2726,6 +2726,8 @@ static void tcg_reg_alloc_start(TCGContext *s)
 {
     int i, n;
 
+    s->reg_tb_temps = tcg_malloc(sizeof(TCGTemp *) * s->nb_temps);
+    s->nb_reg_tb_temps = 0;
     for (i = 0, n = s->nb_temps; i < n; i++) {
         TCGTemp *ts = &s->temps[i];
         TCGTempVal val = TEMP_VAL_MEM;
@@ -2739,10 +2741,12 @@ static void tcg_reg_alloc_start(TCGContext *s)
             break;
         case TEMP_GLOBAL:
             break;
+        case TEMP_TB:
+            s->reg_tb_temps[s->nb_reg_tb_temps++] = ts;
+            ts->mem_allocated = 0;
+            break;
         case TEMP_EBB:
             val = TEMP_VAL_DEAD;
-            /* fall through */
-        case TEMP_TB:
             ts->mem_allocated = 0;
             break;
         default:
@@ -3734,10 +3738,67 @@ reachable_code_pass(TCGContext *s)
 #define IS_DEAD_ARG(n)   (arg_life & (DEAD_ARG << (n)))
 #define NEED_SYNC_ARG(n) (arg_life & (SYNC_ARG << (n)))
 
+/*
+ * For liveness_pass_1, per temp: the register preferences, and whether
+ * the temp is in LaSet.glob or LaSet.live.
+ */
+typedef struct LaTemp {
+    TCGRegSet pref;
+    bool listed;
+} LaTemp;
+
+/*
+ * For liveness_pass_1: the temps that the la_* functions must visit, so
+ * that the cost of a basic block end, a call or a guest memory access
+ * does not grow with the number of temps and globals of the TB.
+ *   glob: the globals that ops referenced since the last la_func_end(),
+ *     la_bb_end() or la_global_kill(), each once, minus those that
+ *     la_global_sync() found back in the state below.  The others are
+ *     TS_DEAD | TS_MEM, with all the registers of their type preferred.
+ *   live: the non-global temps made live since the last la_func_end()
+ *     or la_bb_end(), each once; they may have died since.  The others
+ *     are dead, with no preferred register, TS_MEM if TEMP_TB.
+ *   tb: all the TEMP_TB temps, which basic block ends mark TS_MEM.
+ */
+typedef struct LaSet {
+    TCGTemp **glob;
+    int nglob;
+    TCGTemp **live;
+    int nlive, live_cap;
+    TCGTemp **tb;
+    int ntb;
+} LaSet;
+
 /* For liveness_pass_1, the register preferences for a given temp.  */
 static inline TCGRegSet *la_temp_pref(TCGTemp *ts)
 {
-    return ts->state_ptr;
+    return &((LaTemp *)ts->state_ptr)->pref;
+}
+
+/*
+ * liveness analysis: the state of @ts changes (a global), or it becomes
+ * live (a non-global temp).
+ */
+static void la_list(TCGContext *s, LaSet *la, TCGTemp *ts)
+{
+    LaTemp *lt = ts->state_ptr;
+
+    if (lt->listed) {
+        return;
+    }
+    lt->listed = true;
+    if (temp_idx(ts) < s->nb_globals) {
+        la->glob[la->nglob++] = ts;
+        return;
+    }
+    if (la->nlive == la->live_cap) {
+        TCGTemp **n = tcg_malloc(sizeof(TCGTemp *) * la->live_cap * 2);
+
+        memcpy(n, la->live, sizeof(TCGTemp *) * la->nlive);
+        la->live = n;
+        la->live_cap *= 2;
+    }
+    la->live[la->nlive++] = ts;
 }
 
 /* For liveness_pass_1, reset the preferences for a given temp to the
@@ -3749,63 +3810,93 @@ static inline void la_reset_pref(TCGTemp *ts)
         = (ts->state == TS_DEAD ? 0 : tcg_target_available_regs[ts->type]);
 }
 
+/* liveness analysis: all the globals dead and in memory */
+static void la_globals_dead(LaSet *la)
+{
+    for (int i = 0; i < la->nglob; ++i) {
+        TCGTemp *ts = la->glob[i];
+
+        ts->state = TS_DEAD | TS_MEM;
+        la_reset_pref(ts);
+        ((LaTemp *)ts->state_ptr)->listed = false;
+    }
+    la->nglob = 0;
+}
+
 /* liveness analysis: end of function: all temps are dead, and globals
    should be in memory. */
-static void la_func_end(TCGContext *s, int ng, int nt)
+static void la_func_end(TCGContext *s, LaSet *la)
 {
     int i;
 
-    for (i = 0; i < ng; ++i) {
-        s->temps[i].state = TS_DEAD | TS_MEM;
-        la_reset_pref(&s->temps[i]);
+    la_globals_dead(la);
+    for (i = 0; i < la->ntb; ++i) {
+        la->tb[i]->state = TS_DEAD;
+        la_reset_pref(la->tb[i]);
     }
-    for (i = ng; i < nt; ++i) {
-        s->temps[i].state = TS_DEAD;
-        la_reset_pref(&s->temps[i]);
+    for (i = 0; i < la->nlive; ++i) {
+        TCGTemp *ts = la->live[i];
+
+        ts->state = TS_DEAD;
+        la_reset_pref(ts);
+        ((LaTemp *)ts->state_ptr)->listed = false;
     }
+    la->nlive = 0;
 }
 
 /* liveness analysis: end of basic block: all temps are dead, globals
    and local temps should be in memory. */
-static void la_bb_end(TCGContext *s, int ng, int nt)
+static void la_bb_end(TCGContext *s, LaSet *la)
 {
     int i;
 
-    for (i = 0; i < nt; ++i) {
-        TCGTemp *ts = &s->temps[i];
-        int state;
+    la_globals_dead(la);
+    for (i = 0; i < la->nlive; ++i) {
+        TCGTemp *ts = la->live[i];
 
         switch (ts->kind) {
-        case TEMP_FIXED:
-        case TEMP_GLOBAL:
         case TEMP_TB:
-            state = TS_DEAD | TS_MEM;
+            ts->state = TS_DEAD | TS_MEM;
             break;
         case TEMP_EBB:
         case TEMP_CONST:
-            state = TS_DEAD;
+            ts->state = TS_DEAD;
             break;
         default:
             g_assert_not_reached();
         }
-        ts->state = state;
         la_reset_pref(ts);
+        ((LaTemp *)ts->state_ptr)->listed = false;
+    }
+    la->nlive = 0;
+    for (i = 0; i < la->ntb; ++i) {
+        la->tb[i]->state = TS_DEAD | TS_MEM;
+        la_reset_pref(la->tb[i]);
     }
 }
 
 /* liveness analysis: sync globals back to memory.  */
-static void la_global_sync(TCGContext *s, int ng)
+static void la_global_sync(TCGContext *s, LaSet *la)
 {
-    int i;
+    int n = 0;
 
-    for (i = 0; i < ng; ++i) {
-        int state = s->temps[i].state;
-        s->temps[i].state = state | TS_MEM;
+    for (int i = 0; i < la->nglob; ++i) {
+        TCGTemp *ts = la->glob[i];
+        int state = ts->state;
+
+        ts->state = state | TS_MEM;
         if (state == TS_DEAD) {
             /* If the global was previously dead, reset prefs.  */
-            la_reset_pref(&s->temps[i]);
+            la_reset_pref(ts);
+        }
+        if (ts->state == (TS_DEAD | TS_MEM)) {
+            /* back to the state of the globals not listed */
+            ((LaTemp *)ts->state_ptr)->listed = false;
+        } else {
+            la->glob[n++] = ts;
         }
     }
+    la->nglob = n;
 }
 
 /*
@@ -3813,62 +3904,54 @@ static void la_global_sync(TCGContext *s, int ng)
  * explicitly live-across-conditional-branch, globals and local temps
  * should be synced.
  */
-static void la_bb_sync(TCGContext *s, int ng, int nt)
+static void la_bb_sync(TCGContext *s, LaSet *la)
 {
-    la_global_sync(s, ng);
+    la_global_sync(s, la);
 
-    for (int i = ng; i < nt; ++i) {
-        TCGTemp *ts = &s->temps[i];
-        int state;
+    /* TEMP_EBB and TEMP_CONST are unchanged */
+    for (int i = 0; i < la->ntb; ++i) {
+        TCGTemp *ts = la->tb[i];
+        int state = ts->state;
 
-        switch (ts->kind) {
-        case TEMP_TB:
-            state = ts->state;
-            ts->state = state | TS_MEM;
-            if (state != TS_DEAD) {
-                continue;
-            }
-            break;
-        case TEMP_EBB:
-        case TEMP_CONST:
-            continue;
-        default:
-            g_assert_not_reached();
+        ts->state = state | TS_MEM;
+        if (state == TS_DEAD) {
+            la_reset_pref(ts);
         }
-        la_reset_pref(&s->temps[i]);
     }
 }
 
 /* liveness analysis: sync globals back to memory and kill.  */
-static void la_global_kill(TCGContext *s, int ng)
+static void la_global_kill(TCGContext *s, LaSet *la)
 {
-    int i;
+    la_globals_dead(la);
+}
 
-    for (i = 0; i < ng; i++) {
-        s->temps[i].state = TS_DEAD | TS_MEM;
-        la_reset_pref(&s->temps[i]);
+/* liveness analysis: note live temps crossing calls.  */
+static void la_cross_call_1(TCGTemp *ts, TCGRegSet mask)
+{
+    if (!(ts->state & TS_DEAD)) {
+        TCGRegSet *pset = la_temp_pref(ts);
+        TCGRegSet set = *pset;
+
+        set &= mask;
+        /* If the combination is not possible, restart.  */
+        if (set == 0) {
+            set = tcg_target_available_regs[ts->type] & mask;
+        }
+        *pset = set;
     }
 }
 
-/* liveness analysis: note live globals crossing calls.  */
-static void la_cross_call(TCGContext *s, int nt)
+static void la_cross_call(TCGContext *s, LaSet *la)
 {
     TCGRegSet mask = ~tcg_target_call_clobber_regs;
     int i;
 
-    for (i = 0; i < nt; i++) {
-        TCGTemp *ts = &s->temps[i];
-        if (!(ts->state & TS_DEAD)) {
-            TCGRegSet *pset = la_temp_pref(ts);
-            TCGRegSet set = *pset;
-
-            set &= mask;
-            /* If the combination is not possible, restart.  */
-            if (set == 0) {
-                set = tcg_target_available_regs[ts->type] & mask;
-            }
-            *pset = set;
-        }
+    for (i = 0; i < la->nglob; i++) {
+        la_cross_call_1(la->glob[i], mask);
+    }
+    for (i = 0; i < la->nlive; i++) {
+        la_cross_call_1(la->live[i], mask);
     }
 }
 
@@ -3961,15 +4044,29 @@ liveness_pass_1(TCGContext *s)
     int nb_globals = s->nb_globals;
     int nb_temps = s->nb_temps;
     TCGOp *op, *op_prev;
-    TCGRegSet *prefs;
+    LaTemp *lts;
+    LaSet la;
 
-    prefs = tcg_malloc(sizeof(TCGRegSet) * nb_temps);
+    lts = tcg_malloc(sizeof(LaTemp) * nb_temps);
+    la.glob = tcg_malloc(sizeof(TCGTemp *) * (nb_globals + 1));
+    la.nglob = 0;
+    la.live_cap = nb_temps - nb_globals + 16;
+    la.live = tcg_malloc(sizeof(TCGTemp *) * la.live_cap);
+    la.nlive = 0;
+    la.tb = tcg_malloc(sizeof(TCGTemp *) * (nb_temps - nb_globals + 1));
+    la.ntb = 0;
+    /* la_func_end() for all */
     for (int i = 0; i < nb_temps; ++i) {
-        s->temps[i].state_ptr = prefs + i;
-    }
+        TCGTemp *ts = &s->temps[i];
 
-    /* ??? Should be redundant with the exit_tb that ends the TB.  */
-    la_func_end(s, nb_globals, nb_temps);
+        ts->state_ptr = lts + i;
+        lts[i].listed = false;
+        ts->state = i < nb_globals ? TS_DEAD | TS_MEM : TS_DEAD;
+        la_reset_pref(ts);
+        if (ts->kind == TEMP_TB) {
+            la.tb[la.ntb++] = ts;
+        }
+    }
 
     s->carry_live = false;
     QTAILQ_FOREACH_REVERSE_SAFE(op, &s->ops, link, op_prev) {
@@ -4014,6 +4111,7 @@ liveness_pass_1(TCGContext *s)
                     }
                     ts->state = TS_DEAD;
                     la_reset_pref(ts);
+                    la_list(s, &la, ts);
                 }
 
                 /* Not used -- it will be tcg_target_call_oarg_reg().  */
@@ -4021,9 +4119,9 @@ liveness_pass_1(TCGContext *s)
 
                 if (!(call_flags & (TCG_CALL_NO_WRITE_GLOBALS |
                                     TCG_CALL_NO_READ_GLOBALS))) {
-                    la_global_kill(s, nb_globals);
+                    la_global_kill(s, &la);
                 } else if (!(call_flags & TCG_CALL_NO_READ_GLOBALS)) {
-                    la_global_sync(s, nb_globals);
+                    la_global_sync(s, &la);
                 }
 
                 /* Record arguments that die in this helper.  */
@@ -4035,7 +4133,7 @@ liveness_pass_1(TCGContext *s)
                 }
 
                 /* For all live registers, remove call-clobbered prefs.  */
-                la_cross_call(s, nb_temps);
+                la_cross_call(s, &la);
 
                 /*
                  * Input arguments are live for preceding opcodes.
@@ -4067,6 +4165,7 @@ liveness_pass_1(TCGContext *s)
                             break;
                         }
                         ts->state &= ~TS_DEAD;
+                        la_list(s, &la, ts);
                     }
                 }
 
@@ -4102,6 +4201,7 @@ liveness_pass_1(TCGContext *s)
             ts = arg_temp(op->args[0]);
             ts->state = TS_DEAD;
             la_reset_pref(ts);
+            la_list(s, &la, ts);
             break;
 
         case INDEX_op_muls2:
@@ -4161,7 +4261,8 @@ liveness_pass_1(TCGContext *s)
                 if (ts->state_ptr == NULL) {
                     tcg_debug_assert(temp_idx(ts) == nb_temps);
                     nb_temps++;
-                    ts->state_ptr = tcg_malloc(sizeof(TCGRegSet));
+                    ts->state_ptr = tcg_malloc(sizeof(LaTemp));
+                    ((LaTemp *)ts->state_ptr)->listed = false;
                     ts->state = TS_DEAD;
                     la_reset_pref(ts);
                 }
@@ -4255,24 +4356,25 @@ liveness_pass_1(TCGContext *s)
                 }
                 ts->state = TS_DEAD;
                 la_reset_pref(ts);
+                la_list(s, &la, ts);
             }
 
             /* If end of basic block, update.  */
             if (def->flags & TCG_OPF_BB_EXIT) {
                 assert_carry_dead(s);
-                la_func_end(s, nb_globals, nb_temps);
+                la_func_end(s, &la);
             } else if (def->flags & TCG_OPF_COND_BRANCH) {
                 assert_carry_dead(s);
-                la_bb_sync(s, nb_globals, nb_temps);
+                la_bb_sync(s, &la);
             } else if (def->flags & TCG_OPF_BB_END) {
                 assert_carry_dead(s);
-                la_bb_end(s, nb_globals, nb_temps);
+                la_bb_end(s, &la);
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 assert_carry_dead(s);
-                la_global_sync(s, nb_globals);
+                la_global_sync(s, &la);
                 if ((def->flags & TCG_OPF_CALL_CLOBBER)
                     && tcg_op_calls(s, op, def)) {
-                    la_cross_call(s, nb_temps);
+                    la_cross_call(s, &la);
                 }
             }
 
@@ -4295,6 +4397,7 @@ liveness_pass_1(TCGContext *s)
                        all regs for the type.  */
                     *la_temp_pref(ts) = tcg_target_available_regs[ts->type];
                     ts->state &= ~TS_DEAD;
+                    la_list(s, &la, ts);
                 }
             }
             if (def->flags & TCG_OPF_CARRY_IN) {
@@ -4920,12 +5023,15 @@ static void sync_globals(TCGContext *s, TCGRegSet allocated_regs)
 static void tcg_reg_alloc_bb_end(TCGContext *s, TCGRegSet allocated_regs)
 {
     assert_carry_dead(s);
+    for (int i = 0; i < s->nb_reg_tb_temps; i++) {
+        temp_save(s, s->reg_tb_temps[i], allocated_regs);
+    }
+#ifdef CONFIG_DEBUG_TCG
     for (int i = s->nb_globals; i < s->nb_temps; i++) {
         TCGTemp *ts = &s->temps[i];
 
         switch (ts->kind) {
         case TEMP_TB:
-            temp_save(s, ts, allocated_regs);
             break;
         case TEMP_EBB:
             /* The liveness analysis already ensures that temps are dead.
@@ -4940,6 +5046,7 @@ static void tcg_reg_alloc_bb_end(TCGContext *s, TCGRegSet allocated_regs)
             g_assert_not_reached();
         }
     }
+#endif
 
     save_globals(s, allocated_regs);
 }
@@ -4954,6 +5061,7 @@ static void tcg_reg_alloc_cbranch(TCGContext *s, TCGRegSet allocated_regs)
     assert_carry_dead(s);
     sync_globals(s, allocated_regs);
 
+#ifdef CONFIG_DEBUG_TCG
     for (int i = s->nb_globals; i < s->nb_temps; i++) {
         TCGTemp *ts = &s->temps[i];
         /*
@@ -4971,6 +5079,7 @@ static void tcg_reg_alloc_cbranch(TCGContext *s, TCGRegSet allocated_regs)
             g_assert_not_reached();
         }
     }
+#endif
 }
 
 /*
