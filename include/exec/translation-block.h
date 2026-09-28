@@ -94,6 +94,8 @@ struct TranslationBlock {
     /* size of target code for this block (1 <= size <= TARGET_PAGE_SIZE) */
     uint16_t size;
     uint16_t icount;
+    /* bit n: exit n may be chained to any TB (see tb_flags_generic_mask) */
+    uint8_t jmp_any;
 
     struct tb_tc tc;
 

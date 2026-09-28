@@ -232,24 +232,36 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
     CPUJumpCache *jc;
-    uint32_t hash;
+    uint32_t hash, gmask, gflags;
 
     /* we should never be trying to look up an INVALID tb */
     tcg_debug_assert(!(s.cflags & CF_INVALID));
 
     hash = tb_jmp_cache_hash_func(s.pc, s.cs_base);
     jc = cpu->tb_jmp_cache;
+    gmask = cpu->cc->tcg_ops->tb_flags_generic_mask;
+    gflags = (s.flags & ~gmask) | cpu->cc->tcg_ops->tb_flags_generic_value;
 
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].pc == s.pc &&
                tb->cs_base == s.cs_base &&
-               tb->flags == s.flags &&
+               (tb->flags == s.flags || (gmask && tb->flags == gflags)) &&
                tb_cflags(tb) == s.cflags)) {
         goto hit;
     }
 
-    tb = tb_htable_lookup(cpu, s);
+    tb = NULL;
+    if (gmask) {
+        /* a TB that does not depend on these flags, see tb_gen_code() */
+        TCGTBCPUState g = s;
+
+        g.flags = gflags;
+        tb = tb_htable_lookup(cpu, g);
+    }
+    if (tb == NULL) {
+        tb = tb_htable_lookup(cpu, s);
+    }
     if (tb == NULL) {
         return NULL;
     }
@@ -1000,9 +1012,22 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 last_tb = NULL;
             }
 #endif
-            /* See if we can patch the calling TB. */
+            /*
+             * See if we can patch the calling TB.  A TB keyed without the
+             * generic flags runs whatever their value, and may only be
+             * chained to a TB that does as well, except where its exit
+             * sets that state (see TCGCPUOps.tb_flags_generic_mask).
+             */
             if (last_tb) {
-                tb_add_jump(last_tb, tb_exit, tb);
+                const TCGCPUOps *ops = cpu->cc->tcg_ops;
+                uint32_t gm = ops->tb_flags_generic_mask;
+                uint32_t gv = ops->tb_flags_generic_value;
+
+                if (!gm || (last_tb->flags & gm) != gv
+                    || (tb->flags & gm) == gv
+                    || (last_tb->jmp_any & (1 << tb_exit))) {
+                    tb_add_jump(last_tb, tb_exit, tb);
+                }
             }
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);

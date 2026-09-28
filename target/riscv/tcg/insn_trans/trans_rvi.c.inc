@@ -184,7 +184,7 @@ static bool trans_jalr(DisasContext *ctx, arg_jalr *a)
     }
 
     /* same TB flags (jalr only sets ELP, see lookup_and_goto_ptr_cached) */
-    lookup_and_goto_ptr_cached(ctx, tcg_constant_i32(ctx->base.tb->flags));
+    lookup_and_goto_ptr_cached(ctx);
 
     if (misaligned) {
         gen_set_label(misaligned);

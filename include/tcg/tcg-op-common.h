@@ -111,6 +111,9 @@ void tcg_gen_lookup_and_goto_ptr_cached(TCGv_i64 pc, intptr_t flags_ofs);
  */
 void tcg_gen_lookup_and_goto_ptr_cached_tb(TCGv_i64 pc, TCGv_i32 flags,
                                            TCGv_i64 cs_base);
+/* the same, where the next TB may also have the flags @flags2 */
+void tcg_gen_lookup_and_goto_ptr_cached_tb2(TCGv_i64 pc, TCGv_i32 flags,
+                                            TCGv_i32 flags2, TCGv_i64 cs_base);
 
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);

@@ -116,6 +116,8 @@ typedef struct DisasContext {
     bool frm_valid;
     bool insn_start_updated;
     const GPtrArray *decoders;
+    /* a vector instruction (not vsetvl*) reads the vector TB flags */
+    bool uses_vec_flags;
     /* zicfilp extension. fcfi_enabled, lp expected or not */
     bool fcfi_enabled;
     bool fcfi_lp_expected;
@@ -291,22 +293,58 @@ static void lookup_and_goto_ptr(DisasContext *ctx)
 }
 
 /*
- * lookup_and_goto_ptr() with the jump cache probed in generated code
- * (user mode, RV64), for a next TB whose flags are @flags and whose
- * cs_base is that of this TB.  Instructions inside a TB change none of
- * the state in the TB flags, except that vstart returns to zero, which
- * can only leave VSTART_EQ_ZERO and VL_EQ_VLMAX conservative (the next TB
- * is then just less optimized), and that Zicfilp sets ELP: not with it.
+ * User mode: the TB flags of the vector state (VILL, SEW, LMUL, VTA, VMA,
+ * VL_EQ_VLMAX, VSTART_EQ_ZERO) only matter to vector instructions other
+ * than vsetvl*.  A TB without any is keyed with them replaced by VILL with
+ * SEW 7 (see TCGCPUOps.tb_flags_generic_mask), so that scalar code after a
+ * vectorized memcpy is not translated again, nor evicted from the jump
+ * cache, for each vtype and vl the memcpy leaves behind.
  */
-static void lookup_and_goto_ptr_cached(DisasContext *ctx, TCGv_i32 flags)
+#define RISCV_TB_FLAGS_VEC_MASK (R_TB_FLAGS_VILL_MASK | R_TB_FLAGS_SEW_MASK | \
+                                 R_TB_FLAGS_LMUL_MASK | R_TB_FLAGS_VTA_MASK | \
+                                 R_TB_FLAGS_VMA_MASK |                      \
+                                 R_TB_FLAGS_VL_EQ_VLMAX_MASK |              \
+                                 R_TB_FLAGS_VSTART_EQ_ZERO_MASK)
+#define RISCV_TB_FLAGS_VEC_GENERIC (R_TB_FLAGS_VILL_MASK | \
+                                    (7 << R_TB_FLAGS_SEW_SHIFT))
+
+static bool riscv_tb_generic(DisasContext *ctx)
+{
+#ifdef CONFIG_USER_ONLY
+    /* no vendor decoder (XTheadVector...) may read the vector flags */
+    return !ctx->uses_vec_flags && ctx->decoders->len == 1;
+#else
+    return false;
+#endif
+}
+
+/*
+ * lookup_and_goto_ptr() with the jump cache probed in generated code
+ * (user mode, RV64), for a next TB with the flags and cs_base of this TB.
+ * Instructions inside a TB change none of the state in the TB flags,
+ * except that vstart returns to zero, which can only leave VSTART_EQ_ZERO
+ * and VL_EQ_VLMAX conservative (the next TB is then just less optimized),
+ * and that Zicfilp sets ELP: not with it.  The next TB may be generic; if
+ * this one is, its vector flags are unknown: only a generic TB matches.
+ */
+static void lookup_and_goto_ptr_cached(DisasContext *ctx)
 {
 #ifdef CONFIG_USER_ONLY
     if (!ctx->fcfi_enabled && get_xl(ctx) == MXL_RV64) {
+        uint32_t own = ctx->base.tb->flags;
+        uint32_t gen = (own & ~RISCV_TB_FLAGS_VEC_MASK)
+                       | RISCV_TB_FLAGS_VEC_GENERIC;
         TCGv_i64 pc = tcg_temp_new_i64();
+        TCGv_i64 cs = tcg_constant_i64(ctx->base.tb->cs_base);
 
         tcg_gen_extu_tl_i64(pc, cpu_pc);
-        tcg_gen_lookup_and_goto_ptr_cached_tb(pc, flags,
-                                  tcg_constant_i64(ctx->base.tb->cs_base));
+        if (riscv_tb_generic(ctx)) {
+            tcg_gen_lookup_and_goto_ptr_cached_tb(pc, tcg_constant_i32(gen),
+                                                  cs);
+        } else {
+            tcg_gen_lookup_and_goto_ptr_cached_tb2(pc, tcg_constant_i32(own),
+                                                   tcg_constant_i32(gen), cs);
+        }
         return;
     }
 #endif
@@ -1317,6 +1355,21 @@ static void decode_opc(CPURISCVState *env, DisasContext *ctx)
         }
         ctx->opcode = opcode;
 
+        /*
+         * OP-V except OPCFG (vsetvl*), and the vector widths of LOAD-FP and
+         * STORE-FP: instructions whose translation reads the vector state
+         * of the TB flags (see riscv_tb_generic).
+         */
+        {
+            uint32_t major = opcode & 0x7f, funct3 = extract32(opcode, 12, 3);
+
+            if ((major == 0x57 && funct3 != 7) ||
+                ((major == 0x07 || major == 0x27) &&
+                 (funct3 == 0 || funct3 >= 5))) {
+                ctx->uses_vec_flags = true;
+            }
+        }
+
         for (guint i = 0; i < ctx->decoders->len; ++i) {
             riscv_cpu_decode_fn func = g_ptr_array_index(ctx->decoders, i);
             if (func(ctx, opcode)) {
@@ -1373,6 +1426,7 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->bcfi_enabled = FIELD_EX32(tb_flags, TB_FLAGS, BCFI_ENABLED);
     ctx->fcfi_lp_expected = FIELD_EX32(tb_flags, TB_FLAGS, FCFI_LP_EXPECTED);
     ctx->fcfi_enabled = FIELD_EX32(tb_flags, TB_FLAGS, FCFI_ENABLED);
+    ctx->uses_vec_flags = false;
     ctx->zero = tcg_constant_tl(0);
     ctx->virt_inst_excp = false;
     ctx->decoders = cpu->decoders;
@@ -1457,6 +1511,7 @@ static void riscv_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     default:
         g_assert_not_reached();
     }
+    tcg_ctx->gen_tb_generic = riscv_tb_generic(ctx);
 }
 
 static const TranslatorOps riscv_tr_ops = {

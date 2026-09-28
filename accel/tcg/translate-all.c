@@ -388,6 +388,14 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     }
     tcg_ctx->gen_tb = NULL;
 
+    tb->jmp_any = tcg_ctx->gen_tb_jmp_any;
+    if (tcg_ctx->gen_tb_generic) {
+        const TCGCPUOps *ops = cpu->cc->tcg_ops;
+
+        tb->flags = (tb->flags & ~ops->tb_flags_generic_mask)
+                    | ops->tb_flags_generic_value;
+    }
+
     search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);
     if (unlikely(search_size < 0)) {
         trace_tb_gen_code_buffer_overflow("encode_search");

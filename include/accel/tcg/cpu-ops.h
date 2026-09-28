@@ -47,6 +47,21 @@ struct TCGCPUOps {
     TCGBar guest_default_memory_order;
 
     /**
+     * @tb_flags_generic_mask, @tb_flags_generic_value: TB flags that only
+     * some instructions depend on (the RISC-V vector state).  A TB whose
+     * translation set tcg_ctx->gen_tb_generic has these flags replaced by
+     * @tb_flags_generic_value, which no CPU state has, and is found for any
+     * value of them: code that does not use them is neither translated
+     * again for each value, nor evicted from the jump cache by its other
+     * versions.  Such a TB is only chained (goto_tb) to another generic TB,
+     * except through the exits listed in tcg_ctx->gen_tb_jmp_any, after
+     * which the state behind these flags is again a function of the key
+     * of the TB.  0: none.
+     */
+    uint32_t tb_flags_generic_mask;
+    uint32_t tb_flags_generic_value;
+
+    /**
      * @initialize: Initialize TCG state
      *
      * Called when the first CPU is realized.

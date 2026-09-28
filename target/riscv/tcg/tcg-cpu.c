@@ -275,6 +275,15 @@ static vaddr riscv_pointer_wrap(CPUState *cs, int mmu_idx,
 const TCGCPUOps riscv_tcg_ops = {
     .mttcg_supported = true,
     .guest_default_memory_order = 0,
+#ifdef CONFIG_USER_ONLY
+    /* the vector state, see riscv_tb_generic() in translate.c */
+    .tb_flags_generic_mask = R_TB_FLAGS_VILL_MASK | R_TB_FLAGS_SEW_MASK |
+                             R_TB_FLAGS_LMUL_MASK | R_TB_FLAGS_VTA_MASK |
+                             R_TB_FLAGS_VMA_MASK | R_TB_FLAGS_VL_EQ_VLMAX_MASK |
+                             R_TB_FLAGS_VSTART_EQ_ZERO_MASK,
+    .tb_flags_generic_value = R_TB_FLAGS_VILL_MASK |
+                              (7 << R_TB_FLAGS_SEW_SHIFT),
+#endif
 
     .initialize = riscv_translate_init,
     .translate_code = riscv_translate_code,

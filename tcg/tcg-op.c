@@ -2649,6 +2649,12 @@ void tcg_gen_lookup_and_goto_ptr(void)
 void tcg_gen_lookup_and_goto_ptr_cached_tb(TCGv_i64 pc, TCGv_i32 flags,
                                            TCGv_i64 cs_base)
 {
+    tcg_gen_lookup_and_goto_ptr_cached_tb2(pc, flags, NULL, cs_base);
+}
+
+void tcg_gen_lookup_and_goto_ptr_cached_tb2(TCGv_i64 pc, TCGv_i32 flags,
+                                            TCGv_i32 flags2, TCGv_i64 cs_base)
+{
 #ifdef CONFIG_USER_ONLY
     /*
      * Same checks as tb_lookup() on its jump cache hit path, done in
@@ -2719,7 +2725,18 @@ void tcg_gen_lookup_and_goto_ptr_cached_tb(TCGv_i64 pc, TCGv_i32 flags,
 
     /* tb->flags and tb->cs_base == those of the current cpu state */
     tcg_gen_ld_i32(a, tb, offsetof(TranslationBlock, flags));
-    tcg_gen_brcond_i32(TCG_COND_NE, a, flags, miss);
+    if (flags2) {
+        /*
+         * or @flags2, e.g. the generic key, see tb_flags_generic_mask;
+         * without a label, which would end the life of the EBB temps
+         */
+        tcg_gen_setcond_i32(TCG_COND_EQ, b, a, flags);
+        tcg_gen_setcond_i32(TCG_COND_EQ, a, a, flags2);
+        tcg_gen_or_i32(a, a, b);
+        tcg_gen_brcondi_i32(TCG_COND_EQ, a, 0, miss);
+    } else {
+        tcg_gen_brcond_i32(TCG_COND_NE, a, flags, miss);
+    }
     tcg_gen_ld_i64(t, tb, offsetof(TranslationBlock, cs_base));
     tcg_gen_brcond_i64(TCG_COND_NE, t, cs_base, miss);
 

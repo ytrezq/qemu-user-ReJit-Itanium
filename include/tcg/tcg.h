@@ -361,6 +361,9 @@ struct TCGContext {
     TCGTemp *frame_temp;
 
     TranslationBlock *gen_tb;     /* tb for which code is being generated */
+    /* set by the translator, see TCGCPUOps.tb_flags_generic_mask */
+    bool gen_tb_generic;
+    uint8_t gen_tb_jmp_any;
     tcg_insn_unit *code_buf;      /* pointer for start of tb */
     tcg_insn_unit *code_ptr;      /* pointer for running end of tb */
 

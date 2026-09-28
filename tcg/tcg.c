@@ -1984,6 +1984,8 @@ void tcg_func_start(TCGContext *s)
     QTAILQ_INIT(&s->ops);
     QTAILQ_INIT(&s->free_ops);
     s->emit_before_op = NULL;
+    s->gen_tb_generic = false;
+    s->gen_tb_jmp_any = 0;
 #ifdef CONFIG_DEBUG_TCG
     /*
      * A translation restarted by tcg_raise_tb_overflow() (too many temps)

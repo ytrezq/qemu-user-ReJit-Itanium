@@ -265,6 +265,8 @@ static bool do_vsetvl_imm(DisasContext *s, int rd, int rs1, TCGv avl,
     gen_set_gpr(s, rd, dst);
     finalize_rvv_inst(s);
 
+    /* both exits set the vector state: see tb_flags_generic_mask */
+    tcg_ctx->gen_tb_jmp_any = 3;
     if (vl_const || maxsz < 8) {
         gen_goto_tb(s, 0, s->cur_insn_len);
     } else {
