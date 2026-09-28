@@ -7864,14 +7864,49 @@ TRANS(SQDMLAL_si, do_scalar_muladd_widening_idx, a,
 TRANS(SQDMLSL_si, do_scalar_muladd_widening_idx, a,
       a->esz == MO_16 ? gen_sqdmlsl_h : gen_sqdmlsl_s, true)
 
+/*
+ * FMUL, FMLA, FMLS (by element), 4S and 2D, in host FP code: the element
+ * is broadcast from memory, then fpop2 or fpop3 as for the vector forms.
+ */
+static bool fpj_vec_idx(DisasContext *s, arg_qrrx_e *a, unsigned fpop,
+                        bool neg)
+{
+    TCGv_vec n, m, d;
+
+    if (!fpop || !a->q || !fpj_ok(s, a->esz, TCG_TYPE_V128, fpop)) {
+        return false;
+    }
+    n = fpj_ld(s, TCG_TYPE_V128, a->rn);
+    m = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_dup_mem_vec(a->esz, m, tcg_env,
+                        vec_reg_offset(s, a->rm, a->idx, a->esz));
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (TCG_FPOP_OP(fpop) == TCG_FPOP_FMA) {
+        TCGv_vec acc = fpj_ld(s, TCG_TYPE_V128, a->rd);
+
+        if (neg) {
+            fpj_sign(TCG_TYPE_V128, a->esz, n, n, false);
+        }
+        tcg_gen_fpop3_vec(a->esz, d, n, m, acc, fpop);
+    } else {
+        tcg_gen_fpop2_vec(a->esz, d, n, m, fpop);
+    }
+    fpj_st(s, TCG_TYPE_V128, a->rd, d);
+    return true;
+}
+
 static bool do_fp3_vector_idx(DisasContext *s, arg_qrrx_e *a,
-                              gen_helper_gvec_3_ptr * const fns[3])
+                              gen_helper_gvec_3_ptr * const fns[3],
+                              unsigned fpop)
 {
     MemOp esz = a->esz;
     int check = fp_access_check_vector_hsd(s, a->q, esz);
 
     if (check <= 0) {
         return check == 0;
+    }
+    if (fpj_vec_idx(s, a, fpop, false)) {
+        return true;
     }
 
     gen_gvec_op3_fpst(s, a->q, a->rd, a->rn, a->rm,
@@ -7885,14 +7920,15 @@ static gen_helper_gvec_3_ptr * const f_vector_idx_fmul[3] = {
     gen_helper_gvec_fmul_idx_s,
     gen_helper_gvec_fmul_idx_d,
 };
-TRANS(FMUL_vi, do_fp3_vector_idx, a, f_vector_idx_fmul)
+TRANS(FMUL_vi, do_fp3_vector_idx, a, f_vector_idx_fmul,
+      TCG_FPOP_MUL | ARM_FPJ_NAN)
 
 static gen_helper_gvec_3_ptr * const f_vector_idx_fmulx[3] = {
     gen_helper_gvec_fmulx_idx_h,
     gen_helper_gvec_fmulx_idx_s,
     gen_helper_gvec_fmulx_idx_d,
 };
-TRANS(FMULX_vi, do_fp3_vector_idx, a, f_vector_idx_fmulx)
+TRANS(FMULX_vi, do_fp3_vector_idx, a, f_vector_idx_fmulx, 0)
 
 static bool do_fmla_vector_idx(DisasContext *s, arg_qrrx_e *a, bool neg)
 {
@@ -7912,6 +7948,9 @@ static bool do_fmla_vector_idx(DisasContext *s, arg_qrrx_e *a, bool neg)
 
     if (check <= 0) {
         return check == 0;
+    }
+    if (fpj_vec_idx(s, a, TCG_FPOP_FMA | ARM_FPJ_NAN, neg)) {
+        return true;
     }
 
     gen_gvec_op4_fpst(s, a->q, a->rd, a->rn, a->rm, a->rd,
@@ -11227,6 +11266,24 @@ static bool do_fabs_fneg_v(DisasContext *s, arg_qrr_e *a, GVecGen2Fn *fn)
 TRANS(FABS_v, do_fabs_fneg_v, a, gen_gvec_fabs)
 TRANS(FNEG_v, do_fabs_fneg_v, a, gen_gvec_fneg)
 
+/*
+ * 4S and 2D one-operand FP ops in host FP code (fpop1_vec).  Not 2S: the
+ * op would be done on 4 lanes, and lanes 2 and 3 could raise exceptions.
+ */
+static bool fpj_vec1(DisasContext *s, arg_qrr_e *a, unsigned fpop)
+{
+    TCGv_vec n, d;
+
+    if (!a->q || !fpop || !fpj_ok(s, a->esz, TCG_TYPE_V128, fpop)) {
+        return false;
+    }
+    n = fpj_ld(s, TCG_TYPE_V128, a->rn);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_fpop1_vec(a->esz, d, n, fpop);
+    fpj_st(s, TCG_TYPE_V128, a->rd, d);
+    return true;
+}
+
 static bool do_fp1_vector(DisasContext *s, arg_qrr_e *a,
                           const FPScalar1 *f, int rmode)
 {
@@ -11236,6 +11293,9 @@ static bool do_fp1_vector(DisasContext *s, arg_qrr_e *a,
 
     if (check <= 0) {
         return check == 0;
+    }
+    if (f->fpop && fpj_vec1(s, a, fpj_fp1_op(f, rmode))) {
+        return true;
     }
 
     fpst = fpstatus_ptr(a->esz == MO_16 ? FPST_A64_F16 : FPST_A64);
@@ -11324,13 +11384,28 @@ static bool do_gvec_op2_ah_fpst(DisasContext *s, MemOp esz, bool is_q,
                                           fns, select_ah_fpst(s, esz));
 }
 
+/* do_gvec_op2_fpst(), or fpj_vec1() with @fpop */
+static bool do_gvec_op2_fpst_j(DisasContext *s, arg_qrr_e *a, int data,
+                               gen_helper_gvec_2_ptr * const fns[3],
+                               unsigned fpop)
+{
+    if (a->q && fpj_ok(s, a->esz, TCG_TYPE_V128, fpop)) {
+        int check = fp_access_check_vector_hsd(s, a->q, a->esz);
+
+        if (check <= 0) {
+            return check == 0;
+        }
+        return fpj_vec1(s, a, fpop);
+    }
+    return do_gvec_op2_fpst(s, a->esz, a->q, a->rd, a->rn, data, fns);
+}
+
 static gen_helper_gvec_2_ptr * const f_scvtf_v[] = {
     gen_helper_gvec_vcvt_sh,
     gen_helper_gvec_vcvt_sf,
     gen_helper_gvec_vcvt_sd,
 };
-TRANS(SCVTF_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, 0, f_scvtf_v)
+TRANS(SCVTF_vi, do_gvec_op2_fpst_j, a, 0, f_scvtf_v, TCG_FPOP_CVT_S)
 TRANS(SCVTF_vf, do_gvec_op2_fpst,
       a->esz, a->q, a->rd, a->rn, a->shift, f_scvtf_v)
 
@@ -11339,8 +11414,7 @@ static gen_helper_gvec_2_ptr * const f_ucvtf_v[] = {
     gen_helper_gvec_vcvt_uf,
     gen_helper_gvec_vcvt_ud,
 };
-TRANS(UCVTF_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, 0, f_ucvtf_v)
+TRANS(UCVTF_vi, do_gvec_op2_fpst_j, a, 0, f_ucvtf_v, TCG_FPOP_CVT_U)
 TRANS(UCVTF_vf, do_gvec_op2_fpst,
       a->esz, a->q, a->rd, a->rn, a->shift, f_ucvtf_v)
 
@@ -11384,10 +11458,12 @@ TRANS(FCVTMS_vi, do_gvec_op2_fpst,
       a->esz, a->q, a->rd, a->rn, float_round_down, f_fcvt_s_vi)
 TRANS(FCVTMU_vi, do_gvec_op2_fpst,
       a->esz, a->q, a->rd, a->rn, float_round_down, f_fcvt_u_vi)
-TRANS(FCVTZS_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_to_zero, f_fcvt_s_vi)
-TRANS(FCVTZU_vi, do_gvec_op2_fpst,
-      a->esz, a->q, a->rd, a->rn, float_round_to_zero, f_fcvt_u_vi)
+/* saturating, a NaN gives 0 (PPC_SAT does it for unsigned) */
+TRANS(FCVTZS_vi, do_gvec_op2_fpst_j, a, float_round_to_zero, f_fcvt_s_vi,
+      TCG_FPOP_CVTI_S | TCG_FPOP_F_TRUNC | TCG_FPOP_F_PPC_SAT
+      | TCG_FPOP_F_NAN_ZERO)
+TRANS(FCVTZU_vi, do_gvec_op2_fpst_j, a, float_round_to_zero, f_fcvt_u_vi,
+      TCG_FPOP_CVTI_U | TCG_FPOP_F_TRUNC | TCG_FPOP_F_PPC_SAT)
 TRANS(FCVTAS_vi, do_gvec_op2_fpst,
       a->esz, a->q, a->rd, a->rn, float_round_ties_away, f_fcvt_s_vi)
 TRANS(FCVTAU_vi, do_gvec_op2_fpst,
