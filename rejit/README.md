@@ -17,7 +17,7 @@ Ces appels sont remplacés par du **code généré**. Pour cela, TCG a reçu de 
 
 | Chemin | Rôle |
 |---|---|
-| l'arbre de QEMU | QEMU 11.1.1 et les commits du fork : `git log --oneline v11.1.1..` (ou `git format-patch v11.1.1..` pour la série de patches) |
+| l'arbre de QEMU | QEMU 11.1.1 et les commits du fork : `git log --oneline c3d48b7d1e..` (ou `git format-patch c3d48b7d1e..` pour la série de patches) ; `c3d48b7d1e` est le commit du tag `v11.1.1` de QEMU |
 | `rejit/bin/qemu-ppc64le`, `qemu-aarch64`, `qemu-arm`, `qemu-riscv64` | binaires statiques pour Linux x86-64 (strippés), compilés depuis ce dépôt |
 | `rejit/install-binfmt.sh` | enregistre ces binaires dans binfmt_misc (flags `POF`) ; à relancer après un redémarrage ou le remplacement d'un binaire |
 | `rejit/chroot-demo.sh` | chroot dans le rootfs d'une cible via un overlay jetable ; démonstration ou shell |
@@ -38,6 +38,8 @@ make -j"$(nproc)"
 ```
 
 `configure` télécharge les sous-projets meson qui manquent (keycodemapdb, berkeley-softfloat-3…), comme pour tout dépôt git de QEMU.
+
+Le dépôt ne porte pas le tag `v11.1.1` de QEMU ; sans lui, `qemu-* --version` affiche simplement `11.1.1`. Pour retrouver le suffixe `v11.1.1-<n>-g<commit>` : `git fetch https://gitlab.com/qemu-project/qemu.git tag v11.1.1`.
 
 Les binaires de `rejit/bin` ont été produits ainsi :
 

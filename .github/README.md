@@ -37,6 +37,6 @@ make -j"$(nproc)"
 - [`rejit/README.md`](../rejit/README.md) : ce qui a changé, résultats, validation, écarts connus, portée (mode système, autres cibles, autres hôtes) ;
 - [`rejit/README-ppc.md`](../rejit/README-ppc.md) : le détail PowerPC ;
 - [`README.rst`](../README.rst) : le README de QEMU ;
-- les commits du fork : `git log --oneline v11.1.1..`.
+- les commits du fork : `git log --oneline c3d48b7d1e..` (`c3d48b7d1e` : QEMU 11.1.1).
 
 Licence : celle de QEMU (GPL-2.0, voir [`LICENSE`](../LICENSE)).
