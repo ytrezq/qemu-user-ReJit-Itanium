@@ -1997,11 +1997,6 @@ static int pac_jit_mode(void)
     return mode;
 }
 
-static bool pac_jit_enabled(void)
-{
-    return pac_jit_mode() != 0;
-}
-
 /* acc = XXH64_round(acc0, in) */
 static void gen_xxh64_round(TCGv_i64 acc, TCGv_i64 in, uint64_t acc0)
 {
@@ -11708,7 +11703,7 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
      * TCR_EL1 and SCTLR_EL1 are set at reset and never change in user
      * mode, so the PAC field layout and the enabled keys are constants.
      */
-    if (dc->pauth_active && pac_jit_enabled()
+    if (dc->pauth_active && pac_jit_mode() != 0
         && (pac_jit_mode() != 1
             || (cpu_isar_feature(pauth_feature, arm_cpu) >= PauthFeat_2
                 && !cpu_isar_feature(aa64_pauth_qarma5, arm_cpu)

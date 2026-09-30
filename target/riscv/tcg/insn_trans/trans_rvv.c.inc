@@ -887,7 +887,7 @@ static bool ldst_us_trans(uint32_t vd, uint32_t rs1, uint32_t data,
     return true;
 }
 
-#ifdef CONFIG_USER_ONLY
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
 /*
  * The first @bytes bytes of a register (vreg offset @ofs) from or to
  * rs1 + @gofs, as plain loads and stores of 8, 4, 2 and 1 bytes: stores
@@ -2417,7 +2417,7 @@ static bool opivv_cmp_check(DisasContext *s, arg_rmrr *a)
            vext_check_mss(s, a->rd, a->rs1, a->rs2);
 }
 
-#ifdef CONFIG_USER_ONLY
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
 /*
  * Mask results in host code (user mode, VLEN 128 or 256, vstart 0, mask
  * tail undisturbed): mask_merge() writes word @w (bits 64 * w...) of the
@@ -2715,7 +2715,7 @@ GEN_OPIVX_WIDEN_TRANS(vwmaccsu_vx, opivx_overwrite_widen_check)
 GEN_OPIVX_WIDEN_TRANS(vwmaccus_vx, opivx_overwrite_widen_check)
 
 /* Vector Integer Merge and Move Instructions */
-#ifdef CONFIG_USER_ONLY
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
 /*
  * Inline results for vl < VLMAX too (user mode, VLEN 128 or 256, vstart
  * 0, tail undisturbed): vreg_st_vl() writes the elements of register r of
@@ -4369,7 +4369,7 @@ GEN_OPFVV_WIDEN_TRANS(vfwredosum_vs, freduction_widen_check)
  */
 
 /* Vector Mask-Register Logical Instructions */
-#ifdef CONFIG_USER_ONLY
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
 /*
  * vm<op>.mm: word by word, vd = op(vs2, vs1) for the bits below vl (the
  * words up to VLMAX of the current vtype: vl is at most that).
@@ -4484,7 +4484,7 @@ static bool trans_vcpop_m(DisasContext *s, arg_rmr *a)
         mask = tcg_temp_new_ptr();
         src2 = tcg_temp_new_ptr();
         dst = dest_gpr(s, a->rd);
-#ifdef CONFIG_USER_ONLY
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
         if (mask_ok(s, true) && get_xl(s) == MXL_RV64) {
             TCGv_i64 w[4];
             int nw = mask_src_words(s, a->rs2, a->vm, w);
@@ -4528,7 +4528,7 @@ static bool trans_vfirst_m(DisasContext *s, arg_rmr *a)
         mask = tcg_temp_new_ptr();
         src2 = tcg_temp_new_ptr();
         dst = dest_gpr(s, a->rd);
-#ifdef CONFIG_USER_ONLY
+#if defined(CONFIG_USER_ONLY) && defined(TARGET_RISCV64)
         if (mask_ok(s, true) && get_xl(s) == MXL_RV64) {
             TCGv_i64 w[4];
             int nw = mask_src_words(s, a->rs2, a->vm, w);
