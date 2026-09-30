@@ -1,0 +1,5 @@
+# produits des scripts de rejit/
+/.chroot-*
+/rootfs-*
+/bench/.bench-*
+/tests/*/out

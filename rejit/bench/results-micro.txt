@@ -1,0 +1,30 @@
+Micro-benchmarks (hôte Xeon 2,1 GHz Sapphire Rapids, 2 cœurs), origine = QEMU 11.1.1 non modifié
+
+bench/arm/bench.c, bench/ppc/bench.c (gcc -O3 -static) et bench/riscv/bench.c
+(riscv64-linux-gnu-gcc-14 -O3 -march=rv64gcv_zba_zbb_zbs, dynamique, lancé avec
+-L rootfs-riscv64), temps par noyau :
+              entier   flottant  vecteur  chaînes
+x86 natif     0.50 s   0.13 s    0.02 s   0.01 s
+aarch64 orig  0.78 s   1.76 s    1.29 s   1.96 s
+aarch64 JIT   0.74 s   0.34 s    0.14 s   0.27 s
+armv7 orig    2.60 s   1.74 s    1.19 s   2.26 s
+armv7 JIT     2.63 s   0.40 s    0.44 s   0.76 s
+ppc64le orig  0.59 s   6.28 s    3.42 s   0.39 s
+ppc64le JIT   0.57 s   0.28 s    0.15 s   0.37 s
+riscv64 orig  0.49 s   1.83 s    3.79 s   0.23 s
+riscv64 JIT   0.49 s   0.21 s    0.10 s   0.23 s
+
+Programmes ciblés (temps total) :
+aarch64 pacbench.c (-mbranch-protection=standard)   8.97 s -> 1.26 s
+aarch64 vecfp.c    (-O3 -fno-math-errno)            8.01 s -> 0.90 s
+aarch64 matmul.c   (-O2)                            2.97 s -> 0.34 s
+aarch64 strbench.c (-O2)                            4.44 s -> 1.22 s
+armv7   strbench.c (-O2)                            5.08 s -> 4.25 s
+ppc64le strbench.c (-O2 -mcpu=power10)              1.22 s -> 0.70 s
+ppc64le mmabench.c (-O2 -mcpu=power10)              2.41 s -> 0.12 s
+riscv64 strbench.c (gcc-14 -O2 -march=rv64gcv_zba_zbb_zbs)
+                                                   13.65 s -> 0.73 s
+
+riscv64 : chaînes = strlen de glibc en Zbb (orc.b), code scalaire que les deux
+QEMU traduisent de la même façon ; strbench passe surtout par le code que GCC a
+vectorisé dans glibc (strrchr, rawmemchr : vle8ff.v, vmseq, vfirst.m...).

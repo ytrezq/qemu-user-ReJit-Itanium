@@ -1,0 +1,13 @@
+# A = QEMU 11.1.1 d'origine (build-ref), B = bin/qemu-* (JIT, commit e42d5e356)
+# bench/compare.sh riscv64, 3 exécutions alternées, temps minimum ; sorties identiques
+        charge          A         B     A/B
+riscv64 python     14.93s     1.50s   9.93x
+riscv64 pyfp        6.57s     0.75s   8.80x
+riscv64 gzip        1.83s     0.95s   1.94x
+riscv64 xz          8.48s     1.38s   6.15x
+riscv64 sort        1.53s     0.35s   4.40x
+riscv64 sha         1.59s     0.41s   3.85x
+riscv64 awk         6.39s     1.22s   5.23x
+riscv64 grep        0.24s     0.13s   1.77x
+riscv64 rpm         0.37s     0.22s   1.70x
+riscv64 dnf         1.64s     0.81s   2.02x

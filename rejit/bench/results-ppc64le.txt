@@ -1,0 +1,13 @@
+# A = QEMU 11.1.1 d'origine (build-ref), B = bin/qemu-* (JIT, commit e42d5e356)
+# bench/compare.sh ppc64le, 3 exécutions alternées, temps minimum ; sorties identiques
+        charge          A         B     A/B
+ppc64le python      3.50s     2.01s   1.74x
+ppc64le pyfp        2.66s     1.16s   2.30x
+ppc64le gzip        2.38s     1.98s   1.21x
+ppc64le xz          2.17s     1.52s   1.42x
+ppc64le sort        0.45s     0.22s   2.07x
+ppc64le sha         0.96s     0.24s   3.91x
+ppc64le awk         4.27s     1.29s   3.31x
+ppc64le grep        0.22s     0.17s   1.32x
+ppc64le rpm         5.68s     2.20s   2.58x
+ppc64le dnf         1.93s     1.30s   1.48x

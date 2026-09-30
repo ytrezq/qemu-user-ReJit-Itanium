@@ -1,0 +1,13 @@
+# A = QEMU 11.1.1 d'origine (build-ref), B = bin/qemu-* (JIT, commit e42d5e356)
+# bench/compare.sh aarch64, 3 exécutions alternées, temps minimum ; sorties identiques
+        charge          A         B     A/B
+aarch64 python      5.04s     2.40s   2.10x
+aarch64 pyfp        3.13s     1.38s   2.27x
+aarch64 gzip        3.48s     1.95s   1.78x
+aarch64 xz          3.22s     1.90s   1.70x
+aarch64 sort        0.53s     0.24s   2.22x
+aarch64 sha         0.49s     0.19s   2.63x
+aarch64 awk         5.50s     1.52s   3.62x
+aarch64 grep        0.23s     0.18s   1.27x
+aarch64 rpm         4.63s     2.25s   2.06x
+aarch64 dnf         2.27s     1.52s   1.50x
