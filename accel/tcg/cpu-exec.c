@@ -228,46 +228,71 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
+/*
+ * tb_lookup() when the jump cache entry does not hold a TB for the key of
+ * @s: the same entry with the generic flags of the target (a TB that does
+ * not depend on these flags, see TCGCPUOps.tb_flags_generic_mask and
+ * tb_gen_code()), then the QHT with them and with the flags of @s.  Out
+ * of line, so that the hit path of tb_lookup() stays that of upstream for
+ * the targets without generic flags: helper_lookup_tb_ptr() runs at every
+ * indirect branch.
+ */
+static TranslationBlock *tb_lookup_slow(CPUState *cpu, TCGTBCPUState s,
+                                        CPUJumpCache *jc, uint32_t hash)
+{
+    const TCGCPUOps *ops = cpu->cc->tcg_ops;
+    uint32_t gmask = ops->tb_flags_generic_mask;
+    TranslationBlock *tb = NULL;
+
+    if (gmask) {
+        TCGTBCPUState g = s;
+
+        g.flags = (s.flags & ~gmask) | ops->tb_flags_generic_value;
+        tb = qatomic_read(&jc->array[hash].tb);
+        if (tb &&
+            jc->array[hash].pc == s.pc &&
+            tb->cs_base == s.cs_base &&
+            tb->flags == g.flags &&
+            tb_cflags(tb) == s.cflags) {
+            return tb;
+        }
+        tb = tb_htable_lookup(cpu, g);
+    }
+    if (tb == NULL) {
+        tb = tb_htable_lookup(cpu, s);
+    }
+    if (tb != NULL) {
+        jc->array[hash].pc = s.pc;
+        qatomic_set(&jc->array[hash].tb, tb);
+    }
+    return tb;
+}
+
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
     CPUJumpCache *jc;
-    uint32_t hash, gmask, gflags;
+    uint32_t hash;
 
     /* we should never be trying to look up an INVALID tb */
     tcg_debug_assert(!(s.cflags & CF_INVALID));
 
     hash = tb_jmp_cache_hash_func(s.pc, s.cs_base);
     jc = cpu->tb_jmp_cache;
-    gmask = cpu->cc->tcg_ops->tb_flags_generic_mask;
-    gflags = (s.flags & ~gmask) | cpu->cc->tcg_ops->tb_flags_generic_value;
 
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].pc == s.pc &&
                tb->cs_base == s.cs_base &&
-               (tb->flags == s.flags || (gmask && tb->flags == gflags)) &&
+               tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
         goto hit;
     }
 
-    tb = NULL;
-    if (gmask) {
-        /* a TB that does not depend on these flags, see tb_gen_code() */
-        TCGTBCPUState g = s;
-
-        g.flags = gflags;
-        tb = tb_htable_lookup(cpu, g);
-    }
-    if (tb == NULL) {
-        tb = tb_htable_lookup(cpu, s);
-    }
+    tb = tb_lookup_slow(cpu, s, jc, hash);
     if (tb == NULL) {
         return NULL;
     }
-
-    jc->array[hash].pc = s.pc;
-    qatomic_set(&jc->array[hash].tb, tb);
 
 hit:
     /*
