@@ -1313,6 +1313,7 @@ static void gen_goto_ptr(void)
 
 bool arm_fpj_enabled(void)
 {
+#ifdef CONFIG_USER_ONLY
     static int enabled = -1;
 
     if (enabled < 0) {
@@ -1323,6 +1324,15 @@ bool arm_fpj_enabled(void)
                   && tcg_can_emit_fpop(TCG_FPOP_ADD, TCG_TYPE_V64, MO_32);
     }
     return enabled;
+#else
+    /*
+     * System emulation keeps the softfloat helpers: the host FP flags
+     * belong to a host thread, while the FPSR of a vCPU is also read from
+     * other threads (migration, gdbstub, monitor) and several vCPUs may
+     * share one thread (round-robin TCG, icount).
+     */
+    return false;
+#endif
 }
 
 /*

@@ -936,6 +936,5 @@ static inline void gen_event_reg(void)
  * QEMU_ARM_FPJIT=0 in the environment keeps the helpers.
  */
 #define ARM_FPJ_NAN     (TCG_FPOP_F_DEFNAN | TCG_FPOP_F_SNAN_FIRST)
-bool arm_fpj_enabled(void);
 
 #endif /* TARGET_ARM_TRANSLATE_H */

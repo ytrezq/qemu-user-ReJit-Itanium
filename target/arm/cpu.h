@@ -1966,6 +1966,11 @@ QEMU_BUILD_BUG_ON(FPSCR_FPSR_MASK & FPSCR_FPCR_MASK);
  * Return the current AArch64 FPSR value
  */
 uint32_t vfp_get_fpsr(CPUARMState *env);
+/*
+ * Whether FP instructions are compiled to host FP code (TCG fpops, user
+ * mode only), with QEMU_ARM_FPJIT=0 to keep the helpers.
+ */
+bool arm_fpj_enabled(void);
 /* FPSR flags of host FP code still in the host register; fold them in. */
 uint32_t arm_fpj_host_fpsr(CPUARMState *env);
 void arm_fpj_sync(CPUARMState *env);

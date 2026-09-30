@@ -154,15 +154,26 @@ QEMU_BUILD_BUG_ON(TCG_FPEXC_INVALID != FPSR_IOC ||
                   TCG_FPEXC_UNDERFLOW != FPSR_UFC ||
                   TCG_FPEXC_INEXACT != FPSR_IXC);
 
+/*
+ * Whether the host FP flags are the guest's: not when no FP instruction
+ * is compiled to host FP code (system emulation, QEMU_ARM_FPJIT=0, host
+ * without the needed instructions), where other host code (softfloat's
+ * hardfloat paths...) may have left flags there, as upstream QEMU does.
+ */
+static inline bool arm_fpj_host_flags(CPUARMState *env)
+{
+    return !env->vfp.fpj_host_off && arm_fpj_enabled();
+}
+
 uint32_t arm_fpj_host_fpsr(CPUARMState *env)
 {
-    return env->vfp.fpj_host_off ? 0 : tcg_host_fpexc_get();
+    return arm_fpj_host_flags(env) ? tcg_host_fpexc_get() : 0;
 }
 
 /* Fold the host FP flags into FPSR and clear them (before a syscall) */
 void arm_fpj_sync(CPUARMState *env)
 {
-    if (!env->vfp.fpj_host_off) {
+    if (arm_fpj_host_flags(env)) {
         env->vfp.fpsr |= tcg_host_fpexc_get();
         tcg_host_fpexc_clear();
     }
@@ -183,7 +194,7 @@ void vfp_clear_float_status_exc_flags(CPUARMState *env)
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_STD_F16]);
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_AH]);
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_AH_F16]);
-    if (!env->vfp.fpj_host_off) {
+    if (arm_fpj_host_flags(env)) {
         tcg_host_fpexc_clear();
     }
 }

@@ -216,6 +216,7 @@ struct DisasContext {
 
 static bool ppc_fp_jit_allowed(void)
 {
+#ifdef CONFIG_USER_ONLY
     static int allowed = -1;
 
     if (allowed < 0) {
@@ -223,6 +224,15 @@ static bool ppc_fp_jit_allowed(void)
         allowed = !(e && e[0] == '0');
     }
     return allowed;
+#else
+    /*
+     * System emulation keeps the softfloat helpers: the host FP flags
+     * belong to a host thread, while the FPSCR of a vCPU is also read from
+     * other threads (migration, gdbstub, monitor) and several vCPUs may
+     * share one thread (round-robin TCG, icount).
+     */
+    return false;
+#endif
 }
 
 static inline bool is_ppe(const DisasContext *ctx)
