@@ -12,7 +12,13 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
+#ifdef CONFIG_SOFTMMU
+/* Emptied by every TLB flush: small, so that clearing it stays cheap. */
+#define TB_JMP_CACHE_BITS 12
+#else
+/* User mode only empties it on a (rare) tb_flush: larger programs fit. */
 #define TB_JMP_CACHE_BITS 14
+#endif
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 /*
  * User mode hash: with x = pc >> 1, x ^ (x >> 1) maps the low bits of x
